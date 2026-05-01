@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Crosshair / target icon for the floating AIM button -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="36dp"
+    android:height="36dp"
+    android:viewportWidth="36"
+    android:viewportHeight="36">
+
+    <!-- Outer ring -->
+    <path
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="2"
+        android:fillColor="@android:color/transparent"
+        android:pathData="M18,4 A14,14 0 1,1 17.99,4 Z" />
+
+    <!-- Inner ring -->
+    <path
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="1.5"
+        android:fillColor="@android:color/transparent"
+        android:pathData="M18,10 A8,8 0 1,1 17.99,10 Z" />
+
+    <!-- Centre dot -->
+    <path
+        android:fillColor="#FF00E5FF"
+        android:pathData="M18,16 A2,2 0 1,1 17.99,16 Z" />
+
+    <!-- Crosshair lines: top -->
+    <path
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M18,2 L18,8" />
+
+    <!-- Bottom -->
+    <path
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M18,28 L18,34" />
+
+    <!-- Left -->
+    <path
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M2,18 L8,18" />
+
+    <!-- Right -->
+    <path
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M28,18 L34,18" />
+</vector>
