@@ -3,10 +3,10 @@
  * Main React Native UI
  *
  * v7 changes:
- *  - Margin Calibration removed (board bounds now hardcoded from real screenshot).
- *  - AutoPlay methods fixed: setAutoPlay(bool), isAccessibilityReady(), etc.
- *  - Physics aim lines: white glow = striker path, dotted blue = coin path.
- *  - Board detection no longer needs tuning.
+ *  - Removed Margin Calibration feature entirely
+ *  - AutoPlay toggle no longer crashes/exits the app (stability-based, live-CV-only)
+ *  - Upgraded autoplay engine integrated
+ *  - Lines fixed (proper ghost-ball geometry)
  */
 
 import React, {useState, useEffect, useCallback} from 'react';
@@ -38,11 +38,11 @@ const SHOT_MODES: {mode: ShotMode; label: string; desc: string}[] = [
 ];
 
 const LINE_LEGEND = [
-  {color: '#FFFFFF', label: 'Striker path (glow)'},
-  {color: '#4488FF', label: 'Coin predicted path (dotted)'},
-  {color: '#00E5FF', label: '1-wall bounce (cyan)'},
-  {color: '#D946EF', label: '2-wall bounce (magenta)'},
-  {color: '#22C55E', label: 'Target pocket (green)'},
+  {color: '#FFD700', label: '#1 Best (Gold)'},
+  {color: '#00E5FF', label: '#2 (Cyan)'},
+  {color: '#FF8A00', label: '#3 (Orange)'},
+  {color: '#D946EF', label: '#4 (Purple)'},
+  {color: '#22C55E', label: '#5 (Green)'},
 ];
 
 export default function App() {
@@ -51,6 +51,7 @@ export default function App() {
   const [autoDetect, setAutoDetect]           = useState(false);
   const [selectedMode, setSelectedMode]       = useState<ShotMode>('ALL');
   const [sensitivity, setSensitivity]         = useState(1.0);
+  const [detectThreshold, setDetectThreshold] = useState(36);
 
   const [autoPlay, setAutoPlayState]          = useState(false);
   const [autoPlayDelay, setAutoPlayDelay]     = useState(2.0);
@@ -137,17 +138,16 @@ export default function App() {
   const toggleAutoPlay = useCallback(async () => {
     if (!overlayActive || !autoDetect) {
       Alert.alert('Prerequisites Missing',
-        'Start the Overlay and enable Auto-Detect first.');
+        'Start the Overlay and enable Auto-Detect first, then turn on AutoPlay.');
       return;
     }
     if (!accessibilityReady && !autoPlay) {
       Alert.alert(
         'Accessibility Required',
-        'Enable "AIMxASSIST" in Android Accessibility Settings so the app can swipe automatically.',
+        'Enable "AIMxASSIST" in Android Accessibility Settings so the app can ' +
+        'swipe the striker automatically.',
         [
-          {text: 'Open Accessibility', onPress: () => {
-            try { OverlayModule.requestAccessibilityPermission(); } catch {}
-          }},
+          {text: 'Open Accessibility', onPress: () => OverlayModule.requestAccessibilityPermission()},
           {text: 'Cancel', style: 'cancel'},
         ]);
       return;
@@ -156,13 +156,17 @@ export default function App() {
       const next = !autoPlay;
       await OverlayModule.setAutoPlay(next);
       setAutoPlayState(next);
+      if (next) {
+        Alert.alert(
+          'AutoPlay Enabled',
+          'Now switch to your carrom game. The app fires automatically once it detects a stable board — it will NOT fire while you are on this screen.',
+          [{text: 'Got it'}]);
+      }
     } catch (e: any) {
-      if ((e as any).code === 'ERR_NO_ACCESSIBILITY') {
+      if (e.code === 'ERR_NO_ACCESSIBILITY') {
         Alert.alert('Accessibility Not Ready',
           'Enable "AIMxASSIST" in Accessibility Settings first.',
-          [{text: 'Open Settings', onPress: () => {
-            try { OverlayModule.requestAccessibilityPermission(); } catch {}
-          }}]);
+          [{text: 'Open Settings', onPress: () => OverlayModule.requestAccessibilityPermission()}]);
       } else {
         Alert.alert('Error', e.message || 'Could not toggle autoplay');
       }
@@ -177,15 +181,13 @@ export default function App() {
     if (!accessibilityReady) {
       Alert.alert('Accessibility Not Ready',
         'Enable "AIMxASSIST" in Accessibility Settings first.',
-        [{text: 'Open Settings', onPress: () => {
-          try { OverlayModule.requestAccessibilityPermission(); } catch {}
-        }}]);
+        [{text: 'Open Settings', onPress: () => OverlayModule.requestAccessibilityPermission()}]);
       return;
     }
     try {
       await OverlayModule.shootNow();
     } catch (e: any) {
-      Alert.alert('Shot Failed', e.message || 'Could not fire shot');
+      Alert.alert('Shot Failed', e.message || 'Make sure you are in the carrom game with a stable board');
     }
   }, [overlayActive, autoDetect, accessibilityReady]);
 
@@ -199,9 +201,14 @@ export default function App() {
     try { OverlayModule.setSensitivity(val); } catch {}
   }, []);
 
-  const handleAutoPlayDelayChange = useCallback((val: number) => {
+  const handleThresholdChange = useCallback((val: number) => {
+    setDetectThreshold(val);
+    try { OverlayModule.setDetectionThreshold(val); } catch {}
+  }, []);
+
+  const handleAutoPlayDelayChange = useCallback(async (val: number) => {
     setAutoPlayDelay(val);
-    try { OverlayModule.setAutoPlayDelay(Math.round(val * 1000)); } catch {}
+    try { await OverlayModule.setAutoPlayDelay(Math.round(val * 1000)); } catch {}
   }, []);
 
   return (
@@ -219,7 +226,9 @@ export default function App() {
 
         {!hasOverlay && (
           <TouchableOpacity style={styles.permBanner} onPress={requestOverlay}>
-            <Text style={styles.permBannerText}>Grant "Display over other apps" to use the overlay</Text>
+            <Text style={styles.permBannerText}>
+              Grant "Display over other apps" to use the overlay
+            </Text>
             <Text style={styles.permBannerCta}>Tap to grant →</Text>
           </TouchableOpacity>
         )}
@@ -230,8 +239,9 @@ export default function App() {
             <View style={{flex: 1, paddingRight: 8}}>
               <Text style={styles.cardTitle}>Aim Overlay</Text>
               <Text style={styles.cardSub}>
-                {overlayActive ? 'Running — aim lines visible over Carrom Pool'
-                               : 'Start to draw aim lines over any carrom game'}
+                {overlayActive
+                  ? 'Running — aim lines visible on top of Carrom Pool'
+                  : 'Start to draw aim lines over any carrom game'}
               </Text>
             </View>
             <Switch value={overlayActive} onValueChange={toggleOverlay}
@@ -245,7 +255,7 @@ export default function App() {
               <Text style={styles.cardSub}>
                 {autoDetect
                   ? 'Reading screen — striker, coins and pockets detected automatically'
-                  : 'Hardcoded board — no calibration needed (one-time screen permission)'}
+                  : 'Pure-Java detector: reads screen pixels in real-time (one-time permission)'}
               </Text>
             </View>
             <Switch value={autoDetect} onValueChange={toggleAutoDetect}
@@ -256,16 +266,19 @@ export default function App() {
 
         {/* AutoPlay */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>🤖 AutoPlay</Text>
+          <Text style={styles.cardTitle}>AutoPlay</Text>
           <Text style={styles.cardSub}>
-            Automatically swipes the striker — no touch needed.
-            Requires Overlay + Auto-Detect + Accessibility permission.
+            Automatically swipes the striker. Fires ONLY when the carrom board
+            is stable — never while you are on this screen.
+            Requires Overlay + Auto-Detect + Accessibility.
           </Text>
 
           {!accessibilityReady && (
             <TouchableOpacity style={styles.permBanner}
-              onPress={() => { try { OverlayModule.requestAccessibilityPermission(); } catch {} }}>
-              <Text style={styles.permBannerText}>"AIMxASSIST" not enabled in Accessibility Settings</Text>
+              onPress={() => OverlayModule.requestAccessibilityPermission()}>
+              <Text style={styles.permBannerText}>
+                "AIMxASSIST" not enabled in Accessibility Settings
+              </Text>
               <Text style={styles.permBannerCta}>Tap to open Settings →</Text>
             </TouchableOpacity>
           )}
@@ -274,7 +287,9 @@ export default function App() {
             <View style={{flex: 1, paddingRight: 8}}>
               <Text style={styles.cardTitle}>Auto Shoot</Text>
               <Text style={styles.cardSub}>
-                {autoPlay ? `Firing every ${autoPlayDelay.toFixed(1)} s` : 'Off'}
+                {autoPlay
+                  ? 'ACTIVE — switch to carrom game, fires on stable board'
+                  : 'Off — tap to start automatic shooting'}
               </Text>
             </View>
             <Switch value={autoPlay} onValueChange={toggleAutoPlay}
@@ -283,7 +298,7 @@ export default function App() {
           </View>
 
           <View style={[styles.rowSpread, {marginTop: 12}]}>
-            <Text style={styles.cardTitle}>Delay Between Shots</Text>
+            <Text style={styles.cardTitle}>Min Delay Between Shots</Text>
             <Text style={styles.valueLabel}>{autoPlayDelay.toFixed(1)} s</Text>
           </View>
           <Slider style={styles.slider}
@@ -308,12 +323,17 @@ export default function App() {
         {/* Prediction Lines */}
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Prediction Lines</Text>
+          <Text style={styles.cardSub}>
+            Up to 5 lines — ranked by AI ghost-ball score. Gold = best shot.
+          </Text>
           <View style={styles.shotGrid}>
             {SHOT_MODES.map(({mode, label, desc}) => (
               <TouchableOpacity key={mode}
-                style={[styles.shotBtn, selectedMode === mode && styles.shotBtnActive]}
+                style={[styles.shotBtn,
+                  selectedMode === mode && styles.shotBtnActive]}
                 onPress={() => handleModeSelect(mode)}>
-                <Text style={[styles.shotLabel, selectedMode === mode && styles.shotLabelActive]}>{label}</Text>
+                <Text style={[styles.shotLabel,
+                  selectedMode === mode && styles.shotLabelActive]}>{label}</Text>
                 <Text style={styles.shotDesc}>{desc}</Text>
               </TouchableOpacity>
             ))}
@@ -323,6 +343,9 @@ export default function App() {
             {LINE_LEGEND.map(item => (
               <LegendDot key={item.label} color={item.color} label={item.label} />
             ))}
+            <LegendDot color="#FFFFFF" label="Striker path" />
+            <LegendDot color="#00E5FF" label="Wall bounce" />
+            <LegendDot color="#22C55E" label="Coin → pocket" />
           </View>
         </View>
 
@@ -343,23 +366,45 @@ export default function App() {
           </View>
         </View>
 
+        {/* Detection Sensitivity */}
+        <View style={styles.card}>
+          <View style={styles.rowSpread}>
+            <Text style={styles.cardTitle}>Detection Sensitivity</Text>
+            <Text style={[styles.valueLabel, {color: '#00E5FF'}]}>{detectThreshold}</Text>
+          </View>
+          <Text style={styles.cardSub}>
+            Lower = detects more circles (more false positives).
+            Raise to 35–45 to reduce ghost circles.
+          </Text>
+          <Slider style={styles.slider}
+            minimumValue={12} maximumValue={50} step={1}
+            value={detectThreshold} onValueChange={handleThresholdChange}
+            minimumTrackTintColor="#00E5FF" maximumTrackTintColor="#333"
+            thumbTintColor="#00E5FF" />
+        </View>
+
         {/* How To Use */}
         <View style={styles.card}>
           <Text style={styles.cardTitle}>How to Use</Text>
           <Text style={styles.howToStep}>1. Grant "Draw over apps" permission above</Text>
-          <Text style={styles.howToStep}>2. Turn on Aim Overlay</Text>
-          <Text style={styles.howToStep}>3. Enable Auto-Detect (one-time screen permission)</Text>
-          <Text style={styles.howToStep}>4. Open Carrom Pool → tap cyan ⊕ icon → Turn ON</Text>
-          <Text style={styles.howToStep}>5. White glow lines = striker path, blue dotted = coin path</Text>
-          <Text style={styles.howToStep}>6. For AutoPlay: enable "AIMxASSIST" in Android Accessibility</Text>
-          <Text style={styles.howToStep}>   Settings, then flip Auto Shoot ON</Text>
+          <Text style={styles.howToStep}>2. Turn on the Aim Overlay</Text>
+          <Text style={styles.howToStep}>3. Enable Auto-Detect (one-time screen capture permission)</Text>
+          <Text style={styles.howToStep}>4. Open Carrom Pool — lines appear automatically</Text>
+          <Text style={styles.howToStep}>5. Gold line = best shot. Cyan = 2nd best, etc.</Text>
+          <Text style={styles.howToStep}>6. For AutoPlay: enable "AIMxASSIST" in Android</Text>
+          <Text style={styles.howToStep}>   Accessibility Settings, flip Auto Shoot ON, then</Text>
+          <Text style={styles.howToStep}>   switch to your carrom game — it fires by itself</Text>
           <Text style={styles.howToTip}>
-            Board bounds are hardcoded from the real Carrom Disc Pool layout — no calibration needed.
+            AutoPlay waits for a stable board before firing — it will never
+            activate while you are on this app. Use "Shoot Best Shot Now"
+            for a single manual trigger anytime.
           </Text>
         </View>
 
         <View style={styles.footer}>
-          <Text style={styles.footerText}>AIMxASSIST v7.0 • Hardcoded Board • AutoPlay • Android 7+</Text>
+          <Text style={styles.footerText}>
+            AIMxASSIST v7.0 • Ghost-Ball AI • Stable AutoPlay • Android 7+
+          </Text>
         </View>
       </ScrollView>
     </View>
