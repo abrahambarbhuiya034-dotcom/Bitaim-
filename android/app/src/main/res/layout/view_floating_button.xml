@@ -1,28 +1,38 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Floating draggable button that sits on top of Carrom Pool.
-  Tap → toggle aim overlay
-  Drag → reposition anywhere on screen
+  AIM floating button — drag to move, tap to open control popup.
+  Uses a crosshair / target icon for clear visual identity.
 -->
 <FrameLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="56dp"
-    android:layout_height="56dp">
+    android:layout_width="60dp"
+    android:layout_height="60dp">
 
-    <!-- Shadow / background circle -->
+    <!-- Glowing background circle -->
     <View
-        android:layout_width="52dp"
-        android:layout_height="52dp"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
         android:layout_gravity="center"
         android:background="@drawable/floating_btn_bg" />
 
-    <!-- App icon -->
+    <!-- Crosshair icon -->
     <ImageView
         android:id="@+id/floating_icon"
-        android:layout_width="36dp"
-        android:layout_height="36dp"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
         android:layout_gravity="center"
-        android:src="@mipmap/ic_launcher"
-        android:contentDescription="Bit-Aim toggle" />
+        android:src="@drawable/ic_target"
+        android:contentDescription="AIMxASSIST control" />
+
+    <!-- "AIM" label at the bottom -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="2dp"
+        android:text="AIM"
+        android:textColor="#FF00E5FF"
+        android:textSize="7sp"
+        android:textStyle="bold" />
 
 </FrameLayout>
