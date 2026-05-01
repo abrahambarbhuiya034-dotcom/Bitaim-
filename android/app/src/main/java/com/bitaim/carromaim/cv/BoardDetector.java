@@ -1,260 +1,239 @@
 package com.bitaim.carromaim.cv;
 
-import android.graphics.Bitmap;
-import android.graphics.PointF;
-import android.graphics.RectF;
-import android.util.Log;
+  import android.graphics.Bitmap;
+  import android.graphics.PointF;
+  import android.graphics.RectF;
+  import android.util.Log;
 
-import org.opencv.android.Utils;
-import org.opencv.core.Core;
-import org.opencv.core.Mat;
-import org.opencv.core.MatOfPoint;
-import org.opencv.core.Point;
-import org.opencv.core.Rect;
-import org.opencv.core.Scalar;
-import org.opencv.core.Size;
-import org.opencv.imgproc.Imgproc;
+  import com.bitaim.carromaim.MainApplication;
 
-import java.util.ArrayList;
-import java.util.List;
+  import java.util.ArrayList;
+  import java.util.List;
 
-/**
- * BoardDetector — v3
- *
- * Improvements:
- *  1. Auto board detection via wood-colour mask — only the inner square
- *     playing surface (warm tan/orange, H 8-25 HSV) is considered board.
- *  2. Coin detection is restricted to within the detected board rectangle,
- *     eliminating false positives from UI elements (avatars, score circles).
- *  3. Board rect is EMA-smoothed across frames for stability.
- *  4. Coins classified as BLACK (dark), WHITE (light), or RED (queen) only.
- */
-public class BoardDetector {
+  /**
+   * BoardDetector — v3 with safe OpenCV guard.
+   * If OpenCV native libs failed to load, returns a synthetic fallback state
+   * so the rest of the app still runs without crashing.
+   */
+  public class BoardDetector {
 
-    private static final String TAG       = "BoardDetector";
-    private static final int    PROC_W    = 640;
-    private static final float  EMA_BOARD = 0.15f;   // board rect smoothing
+      private static final String TAG = "BoardDetector";
+      private static final int PROC_W = 640;
+      private static final float EMA_BOARD = 0.15f;
 
-    private float  minRadiusFrac = 0.013f;
-    private float  maxRadiusFrac = 0.042f;
-    private double param2        = 20;
+      private float minRadiusFrac = 0.013f;
+      private float maxRadiusFrac = 0.042f;
+      private double param2 = 20;
+      private RectF smoothedBoard = null;
 
-    private RectF  smoothedBoard = null;   // persists across frames
+      // OpenCV Mats — only allocated when CV is available
+      private Object frameMat, smallMat, grayMat, hsvMat, circlesMat;
+      private boolean matsInitialized = false;
 
-    private final Mat frame   = new Mat();
-    private final Mat small   = new Mat();
-    private final Mat gray    = new Mat();
-    private final Mat hsv     = new Mat();
-    private final Mat circles = new Mat();
+      public void setMinRadiusFrac(float v) { minRadiusFrac = Math.max(0.005f, Math.min(v, 0.05f)); }
+      public void setMaxRadiusFrac(float v) { maxRadiusFrac = Math.max(0.02f, Math.min(v, 0.10f)); }
+      public void setParam2(double v)       { param2 = Math.max(10, Math.min(v, 60)); }
 
-    public void setMinRadiusFrac(float v) { minRadiusFrac = Math.max(0.005f, Math.min(v, 0.05f)); }
-    public void setMaxRadiusFrac(float v) { maxRadiusFrac = Math.max(0.02f,  Math.min(v, 0.10f)); }
-    public void setParam2(double v)       { param2 = Math.max(10, Math.min(v, 60)); }
+      public synchronized GameState detect(Bitmap bitmap) {
+          if (bitmap == null) return null;
 
-    public synchronized GameState detect(Bitmap bitmap) {
-        if (bitmap == null) return null;
-        int srcW = bitmap.getWidth(), srcH = bitmap.getHeight();
-        if (srcW == 0 || srcH == 0) return null;
+          // If OpenCV unavailable, return synthetic fallback
+          if (!MainApplication.cvReady) {
+              return syntheticState(bitmap.getWidth(), bitmap.getHeight());
+          }
 
-        Utils.bitmapToMat(bitmap, frame);
-        float scale = (float) PROC_W / srcW;
-        int   procH = Math.round(srcH * scale);
-        Imgproc.resize(frame, small, new Size(PROC_W, procH), 0, 0, Imgproc.INTER_AREA);
-        Imgproc.cvtColor(small, hsv,  Imgproc.COLOR_RGB2HSV);
-        Imgproc.cvtColor(small, gray, Imgproc.COLOR_RGBA2GRAY);
-        Imgproc.medianBlur(gray, gray, 5);
+          try {
+              return detectWithCV(bitmap);
+          } catch (Throwable t) {
+              Log.e(TAG, "CV detect error: " + t.getMessage());
+              return syntheticState(bitmap.getWidth(), bitmap.getHeight());
+          }
+      }
 
-        // ── 1. Detect board by wood colour ──────────────────────────────────
-        RectF rawBoard = detectBoardRect(srcW, srcH, scale);
-        smoothedBoard  = smoothRect(smoothedBoard, rawBoard);
-        RectF board    = smoothedBoard;
+      private GameState detectWithCV(Bitmap bitmap) throws Throwable {
+          int srcW = bitmap.getWidth(), srcH = bitmap.getHeight();
+          if (srcW == 0 || srcH == 0) return null;
 
-        // ── 2. Restrict HoughCircles to inner board area ────────────────────
-        Rect roiRect = null;
-        Mat  roiGray = gray, roiHsv = hsv;
-        float roiOffX = 0, roiOffY = 0;
-        if (board != null) {
-            // Shrink board by ~6% to exclude the cushion/pocket areas
-            float inset = board.width() * 0.06f;
-            int rx = Math.max(0, Math.round((board.left + inset) * scale));
-            int ry = Math.max(0, Math.round((board.top  + inset) * scale));
-            int rw = Math.min(PROC_W  - rx, Math.round((board.width()  - 2*inset) * scale));
-            int rh = Math.min(procH   - ry, Math.round((board.height() - 2*inset) * scale));
-            if (rw > 20 && rh > 20) {
-                roiRect = new Rect(rx, ry, rw, rh);
-                roiGray = gray.submat(roiRect);
-                roiHsv  = hsv .submat(roiRect);
-                roiOffX = rx;
-                roiOffY = ry;
-            }
-        }
+          // Lazy init Mats
+          if (!matsInitialized) {
+              frameMat   = new org.opencv.core.Mat();
+              smallMat   = new org.opencv.core.Mat();
+              grayMat    = new org.opencv.core.Mat();
+              hsvMat     = new org.opencv.core.Mat();
+              circlesMat = new org.opencv.core.Mat();
+              matsInitialized = true;
+          }
 
-        // ── 3. HoughCircles ──────────────────────────────────────────────────
-        int minR    = Math.round(PROC_W * minRadiusFrac);
-        int maxR    = Math.round(PROC_W * maxRadiusFrac);
-        int minDist = (int)(minR * 1.8);
-        Imgproc.HoughCircles(roiGray, circles, Imgproc.HOUGH_GRADIENT,
-                1.2, minDist, 100, param2, minR, maxR);
+          org.opencv.core.Mat frame   = (org.opencv.core.Mat) frameMat;
+          org.opencv.core.Mat small   = (org.opencv.core.Mat) smallMat;
+          org.opencv.core.Mat gray    = (org.opencv.core.Mat) grayMat;
+          org.opencv.core.Mat hsv     = (org.opencv.core.Mat) hsvMat;
+          org.opencv.core.Mat circles = (org.opencv.core.Mat) circlesMat;
 
-        GameState state = new GameState();
-        List<Coin>  all = new ArrayList<>();
+          org.opencv.android.Utils.bitmapToMat(bitmap, frame);
+          float scale = (float) PROC_W / srcW;
+          int procH = Math.round(srcH * scale);
+          org.opencv.imgproc.Imgproc.resize(frame, small,
+                  new org.opencv.core.Size(PROC_W, procH), 0, 0, org.opencv.imgproc.Imgproc.INTER_AREA);
+          org.opencv.imgproc.Imgproc.cvtColor(small, hsv,  org.opencv.imgproc.Imgproc.COLOR_RGB2HSV);
+          org.opencv.imgproc.Imgproc.cvtColor(small, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY);
+          org.opencv.imgproc.Imgproc.medianBlur(gray, gray, 5);
 
-        if (!circles.empty()) {
-            int n = circles.cols();
-            for (int i = 0; i < n; i++) {
-                double[] c = circles.get(0, i);
-                if (c == null || c.length < 3) continue;
-                float cx = (float)c[0], cy = (float)c[1], cr = (float)c[2];
-                int colorClass = classifyColor(roiHsv, (int)cx, (int)cy, (int)cr);
-                if (colorClass < 0) continue;
-                // Map back to screen coords (ROI offset + scale)
-                float scx = (cx + roiOffX) / scale;
-                float scy = (cy + roiOffY) / scale;
-                float scr = cr / scale;
-                all.add(new Coin(scx, scy, scr, colorClass, false));
-            }
-        }
-        if (roiRect != null) { roiGray.release(); roiHsv.release(); }
+          RectF rawBoard = detectBoardRect(hsv, small, srcW, srcH, scale, procH);
+          smoothedBoard  = smoothRect(smoothedBoard, rawBoard);
+          RectF board    = smoothedBoard;
 
-        // ── 4. Identify striker (largest white circle in lower 40%) ─────────
-        float lowerThreshold = srcH * 0.55f;
-        Coin  striker = null;
-        float strikerScore = -1;
-        for (Coin c : all) {
-            if (c.color != Coin.COLOR_WHITE) continue;
-            float yBonus = (c.pos.y > lowerThreshold) ? 2.0f : 1.0f;
-            float score  = c.radius * yBonus;
-            if (score > strikerScore) { strikerScore = score; striker = c; }
-        }
-        if (striker != null) {
-            striker.isStriker = true;
-            striker.color     = Coin.COLOR_STRIKER;
-            state.striker     = striker;
-        }
-        for (Coin c : all) {
-            if (c != striker) state.coins.add(c);
-        }
+          // ROI within board
+          org.opencv.core.Mat roiGray = gray;
+          org.opencv.core.Mat roiHsv  = hsv;
+          float roiOffX = 0, roiOffY = 0;
+          org.opencv.core.Rect roiRect = null;
+          if (board != null) {
+              float inset = board.width() * 0.06f;
+              int rx = Math.max(0, Math.round((board.left + inset) * scale));
+              int ry = Math.max(0, Math.round((board.top  + inset) * scale));
+              int rw = Math.min(PROC_W - rx, Math.round((board.width()  - 2*inset) * scale));
+              int rh = Math.min(procH  - ry, Math.round((board.height() - 2*inset) * scale));
+              if (rw > 20 && rh > 20) {
+                  roiRect = new org.opencv.core.Rect(rx, ry, rw, rh);
+                  roiGray = gray.submat(roiRect);
+                  roiHsv  = hsv .submat(roiRect);
+                  roiOffX = rx; roiOffY = ry;
+              }
+          }
 
-        // ── 5. Board + pockets ───────────────────────────────────────────────
-        state.board = board != null ? board : fallbackBoard(srcW, srcH);
-        addPockets(state);
-        return state;
-    }
+          int minR    = Math.round(PROC_W * minRadiusFrac);
+          int maxR    = Math.round(PROC_W * maxRadiusFrac);
+          int minDist = (int)(minR * 1.8);
+          org.opencv.imgproc.Imgproc.HoughCircles(roiGray, circles,
+                  org.opencv.imgproc.Imgproc.HOUGH_GRADIENT, 1.2, minDist, 100, param2, minR, maxR);
 
-    // ── Board detection via wood-colour mask ─────────────────────────────────
+          GameState state = new GameState();
+          List<Coin> all = new ArrayList<>();
 
-    /**
-     * Find the bounding rectangle of the warm wood-coloured region in the
-     * downscaled frame. The carrom board has a distinctive tan/orange wood
-     * colour (H 8–28, S 40–200, V 90–220 in OpenCV HSV).
-     */
-    private RectF detectBoardRect(int srcW, int srcH, float scale) {
-        Mat woodMask = new Mat();
-        // Wood colour range (handles both lighter and darker board themes)
-        Core.inRange(hsv,
-                new Scalar(8,  35,  80),   // lower bound (H, S, V)
-                new Scalar(28, 210, 225),  // upper bound
-                woodMask);
+          if (!circles.empty()) {
+              int n = circles.cols();
+              for (int i = 0; i < n; i++) {
+                  double[] c = circles.get(0, i);
+                  if (c == null || c.length < 3) continue;
+                  int colorClass = classifyColor(roiHsv, (int)c[0], (int)c[1], (int)c[2]);
+                  if (colorClass < 0) continue;
+                  all.add(new Coin(
+                      (c[0] + roiOffX) / scale, (c[1] + roiOffY) / scale,
+                      c[2] / scale, colorClass, false));
+              }
+          }
+          if (roiRect != null) { roiGray.release(); roiHsv.release(); }
 
-        // Morphological close to fill small gaps
-        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(9, 9));
-        Imgproc.morphologyEx(woodMask, woodMask, Imgproc.MORPH_CLOSE, kernel);
-        Imgproc.morphologyEx(woodMask, woodMask, Imgproc.MORPH_OPEN,  kernel);
-        kernel.release();
+          float lowerThreshold = srcH * 0.55f;
+          Coin striker = null; float strikerScore = -1;
+          for (Coin c : all) {
+              if (c.color != Coin.COLOR_WHITE) continue;
+              float score = c.radius * (c.pos.y > lowerThreshold ? 2.0f : 1.0f);
+              if (score > strikerScore) { strikerScore = score; striker = c; }
+          }
+          if (striker != null) {
+              striker.isStriker = true; striker.color = Coin.COLOR_STRIKER;
+              state.striker = striker;
+          }
+          for (Coin c : all) if (c != striker) state.coins.add(c);
 
-        // Find largest contour
-        List<MatOfPoint> contours = new ArrayList<>();
-        Mat hierarchy = new Mat();
-        Imgproc.findContours(woodMask, contours, hierarchy,
-                Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-        hierarchy.release();
-        woodMask.release();
+          state.board = board != null ? board : fallbackBoard(srcW, srcH);
+          addPockets(state);
+          return state;
+      }
 
-        double bestArea = 0;
-        Rect   bestRect = null;
-        for (MatOfPoint c : contours) {
-            Rect r = Imgproc.boundingRect(c);
-            double area = r.width * (double) r.height;
-            if (area > bestArea) { bestArea = area; bestRect = r; }
-            c.release();
-        }
+      private RectF detectBoardRect(org.opencv.core.Mat hsv,
+                                    org.opencv.core.Mat small,
+                                    int srcW, int srcH, float scale, int procH) {
+          org.opencv.core.Mat woodMask = new org.opencv.core.Mat();
+          org.opencv.core.Core.inRange(hsv,
+                  new org.opencv.core.Scalar(8, 35, 80),
+                  new org.opencv.core.Scalar(28, 210, 225), woodMask);
 
-        if (bestRect == null || bestArea < 0.04 * PROC_W * PROC_W) {
-            return null; // Not enough wood detected — use fallback
-        }
+          org.opencv.core.Mat kernel = org.opencv.imgproc.Imgproc.getStructuringElement(
+                  org.opencv.imgproc.Imgproc.MORPH_RECT, new org.opencv.core.Size(9, 9));
+          org.opencv.imgproc.Imgproc.morphologyEx(woodMask, woodMask,
+                  org.opencv.imgproc.Imgproc.MORPH_CLOSE, kernel);
+          org.opencv.imgproc.Imgproc.morphologyEx(woodMask, woodMask,
+                  org.opencv.imgproc.Imgproc.MORPH_OPEN,  kernel);
+          kernel.release();
 
-        // Convert to screen coords, force square
-        float l = bestRect.x / scale, t = bestRect.y / scale;
-        float r = (bestRect.x + bestRect.width)  / scale;
-        float b = (bestRect.y + bestRect.height) / scale;
+          List<org.opencv.core.MatOfPoint> contours = new ArrayList<>();
+          org.opencv.imgproc.Imgproc.findContours(woodMask, contours, new org.opencv.core.Mat(),
+                  org.opencv.imgproc.Imgproc.RETR_EXTERNAL,
+                  org.opencv.imgproc.Imgproc.CHAIN_APPROX_SIMPLE);
+          woodMask.release();
 
-        // Make it square (take the larger dimension)
-        float side = Math.max(r - l, b - t);
-        float cx   = (l + r) / 2f, cy = (t + b) / 2f;
-        float nl = cx - side/2f, nt = cy - side/2f;
-        float nr = cx + side/2f, nb = cy + side/2f;
+          double bestArea = 0;
+          org.opencv.core.Rect bestRect = null;
+          for (org.opencv.core.MatOfPoint c : contours) {
+              org.opencv.core.Rect r = org.opencv.imgproc.Imgproc.boundingRect(c);
+              double area = r.width * (double) r.height;
+              if (area > bestArea) { bestArea = area; bestRect = r; }
+              c.release();
+          }
 
-        // Clamp into screen
-        nl = Math.max(0, nl); nt = Math.max(0, nt);
-        nr = Math.min(srcW, nr); nb = Math.min(srcH, nb);
-        return new RectF(nl, nt, nr, nb);
-    }
+          if (bestRect == null || bestArea < 0.04 * PROC_W * PROC_W) return null;
 
-    // ── Colour classification ─────────────────────────────────────────────────
+          float l = bestRect.x / scale, t = bestRect.y / scale;
+          float r = (bestRect.x + bestRect.width)  / scale;
+          float b = (bestRect.y + bestRect.height) / scale;
+          float side = Math.max(r - l, b - t);
+          float cx = (l + r) / 2f, cy = (t + b) / 2f;
+          return new RectF(
+              Math.max(0, cx - side/2f), Math.max(0, cy - side/2f),
+              Math.min(srcW, cx + side/2f), Math.min(srcH, cy + side/2f));
+      }
 
-    private int classifyColor(Mat hsvMat, int x, int y, int r) {
-        if (r < 2) return -1;
-        if (x - r < 0 || y - r < 0 || x + r >= hsvMat.cols() || y + r >= hsvMat.rows()) return -1;
+      private int classifyColor(org.opencv.core.Mat hsvMat, int x, int y, int r) {
+          if (r < 2) return -1;
+          if (x-r<0||y-r<0||x+r>=hsvMat.cols()||y+r>=hsvMat.rows()) return -1;
+          int s = Math.max(1, r / 4);
+          org.opencv.core.Mat patch = hsvMat.submat(
+                  Math.max(0,y-s), Math.min(hsvMat.rows(),y+s),
+                  Math.max(0,x-s), Math.min(hsvMat.cols(),x+s));
+          org.opencv.core.Scalar mean = org.opencv.core.Core.mean(patch);
+          patch.release();
+          double h = mean.val[0], sat = mean.val[1], v = mean.val[2];
+          if (v < 65) return Coin.COLOR_BLACK;
+          if (v > 170 && sat < 65) return Coin.COLOR_WHITE;
+          if (sat > 85 && (h < 14 || h > 162)) return Coin.COLOR_RED;
+          if (h >= 8 && h <= 28 && sat > 35) return -1;
+          return -1;
+      }
 
-        int s = Math.max(1, r / 4);
-        Mat patch = hsvMat.submat(
-                Math.max(0, y-s), Math.min(hsvMat.rows(), y+s),
-                Math.max(0, x-s), Math.min(hsvMat.cols(), x+s));
-        Scalar mean = Core.mean(patch);
-        patch.release();
+      /** Synthetic state used when OpenCV is unavailable — places striker at bottom centre */
+      private GameState syntheticState(int w, int h) {
+          GameState s = new GameState();
+          float side = w * 0.70f;
+          float cx = w / 2f, cy = h * 0.50f;
+          s.board = new RectF(cx - side/2f, cy - side/2f, cx + side/2f, cy + side/2f);
+          s.striker = new Coin(cx, cy + side*0.35f, side*0.025f, Coin.COLOR_STRIKER, true);
+          addPockets(s);
+          return s;
+      }
 
-        double h = mean.val[0]; // 0..180
-        double sat = mean.val[1]; // 0..255
-        double v = mean.val[2]; // 0..255
+      private RectF fallbackBoard(int w, int h) {
+          float side = w * 0.70f;
+          float cx = w / 2f, cy = h * 0.50f;
+          return new RectF(cx-side/2f, cy-side/2f, cx+side/2f, cy+side/2f);
+      }
 
-        // Black coin — very dark
-        if (v < 65) return Coin.COLOR_BLACK;
-        // White coin / striker — bright and low saturation
-        if (v > 170 && sat < 65) return Coin.COLOR_WHITE;
-        // Red queen — reddish hue, saturated
-        if (sat > 85 && (h < 14 || h > 162)) return Coin.COLOR_RED;
-        // Wood tone — reject (board surface)
-        if (h >= 8 && h <= 28 && sat > 35) return -1;
+      private void addPockets(GameState s) {
+          if (s.board == null) return;
+          float i = s.board.width() * 0.03f;
+          s.pockets.add(new PointF(s.board.left+i,  s.board.top+i));
+          s.pockets.add(new PointF(s.board.right-i, s.board.top+i));
+          s.pockets.add(new PointF(s.board.left+i,  s.board.bottom-i));
+          s.pockets.add(new PointF(s.board.right-i, s.board.bottom-i));
+      }
 
-        return -1;
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private RectF fallbackBoard(int w, int h) {
-        // Fallback: assume board is centred, occupying ~70% of width
-        float side = w * 0.70f;
-        float cx = w / 2f, cy = h * 0.50f;
-        return new RectF(cx - side/2f, cy - side/2f, cx + side/2f, cy + side/2f);
-    }
-
-    private void addPockets(GameState state) {
-        if (state.board == null) return;
-        float inset = state.board.width() * 0.03f;
-        state.pockets.add(new PointF(state.board.left  + inset, state.board.top    + inset));
-        state.pockets.add(new PointF(state.board.right - inset, state.board.top    + inset));
-        state.pockets.add(new PointF(state.board.left  + inset, state.board.bottom - inset));
-        state.pockets.add(new PointF(state.board.right - inset, state.board.bottom - inset));
-    }
-
-    private RectF smoothRect(RectF prev, RectF next) {
-        if (prev == null) return next;
-        if (next == null) return prev; // keep last known board
-        float a = EMA_BOARD;
-        return new RectF(
-            prev.left   + a*(next.left   - prev.left),
-            prev.top    + a*(next.top    - prev.top),
-            prev.right  + a*(next.right  - prev.right),
-            prev.bottom + a*(next.bottom - prev.bottom));
-    }
-}
+      private RectF smoothRect(RectF p, RectF n) {
+          if (p == null) return n; if (n == null) return p;
+          float a = EMA_BOARD;
+          return new RectF(p.left+a*(n.left-p.left), p.top+a*(n.top-p.top),
+                           p.right+a*(n.right-p.right), p.bottom+a*(n.bottom-p.bottom));
+      }
+  }
+  
