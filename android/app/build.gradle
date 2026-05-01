@@ -3,7 +3,7 @@ apply plugin: "kotlin-android"
 apply plugin: "com.facebook.react"
 
 react {
-    // React Native config — auto-links native modules
+    // React Native auto-linking
 }
 
 android {
@@ -12,22 +12,17 @@ android {
 
     defaultConfig {
         applicationId "com.bitaim.carromaim"
-        minSdkVersion 23          // Android 6.0 Marshmallow
+        minSdkVersion 23          // Android 6.0+
         targetSdkVersion 34       // Android 14
-        versionCode 2
-        versionName "2.0"
+        versionCode 6
+        versionName "6.0"
         multiDexEnabled true
 
-        // Keep APK reasonable — OpenCV adds ~30MB per ABI; ship the two common ones.
+        // Pure-Java detector — no native .so files needed.
+        // Keeping only arm64-v8a makes the APK ~20 MB smaller.
         ndk {
             abiFilters "armeabi-v7a", "arm64-v8a"
         }
-    }
-
-    packagingOptions {
-        // OpenCV ships duplicate .so resources across ABIs that confuse Gradle.
-        pickFirst "lib/*/libc++_shared.so"
-        pickFirst "lib/*/libopencv_java4.so"
     }
 
     buildTypes {
@@ -35,7 +30,7 @@ android {
             minifyEnabled true
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"),
                     "proguard-rules.pro"
-            signingConfig signingConfigs.debug  // replace with release keystore
+            signingConfig signingConfigs.debug  // replace with release keystore for production
         }
         debug {
             debuggable true
@@ -61,9 +56,8 @@ dependencies {
     implementation "com.google.android.material:material:1.9.0"
     implementation "androidx.multidex:multidex:2.0.1"
 
-    // OpenCV Android SDK — used for HoughCircles, color classification.
-    // Resolved from JitPack (configured in root build.gradle).
-    implementation "com.quickbirdstudios:opencv:4.5.3.0"
+    // OpenCV removed — BoardDetector v6 uses pure Java Bitmap pixel APIs.
+    // APK is ~30 MB smaller as a result.
 }
 
 apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
