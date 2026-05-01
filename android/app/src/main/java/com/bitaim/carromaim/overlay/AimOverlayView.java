@@ -7,7 +7,6 @@ import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.PointF;
 import android.graphics.RectF;
-import android.view.MotionEvent;
 import android.view.View;
 
 import com.bitaim.carromaim.cv.Coin;
@@ -15,263 +14,264 @@ import com.bitaim.carromaim.cv.GameState;
 import com.bitaim.carromaim.cv.TrajectorySimulator;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
- * AimOverlayView
+ * AimOverlayView — v3
  *
- * Transparent fullscreen overlay that draws auto-detected game state
- * (striker, coins, pockets, board) plus the predicted trajectories of
- * every moving body when the user picks an aim target.
- *
- * Behavior changes from the original version:
- *   - Striker is LOCKED — touching the striker no longer drags it.
- *     The striker position is whatever the screen-capture detector reports.
- *   - On tap/drag, the touch point becomes the aim target.
- *   - Renders multi-line predictions for ALL shot types simultaneously
- *     (driven by TrajectorySimulator), including coin-on-coin chain
- *     reactions and cushion bounces.
+ * Fully automatic overlay — no touch input required.
+ * - Positions are EMA-smoothed to eliminate jitter.
+ * - Auto-computes the top 5 best shots (coin → nearest pocket).
+ * - Draws a max of 5 prediction lines inside the board bounds.
+ * - Watermark "created by abraham / Xhay" at board centre.
  */
 public class AimOverlayView extends View {
 
+    public static final String MODE_ALL    = "ALL";
     public static final String MODE_DIRECT = "DIRECT";
     public static final String MODE_AI     = "AI";
     public static final String MODE_GOLDEN = "GOLDEN";
     public static final String MODE_LUCKY  = "LUCKY";
-    public static final String MODE_ALL    = "ALL";
+
+    private static final int   MAX_LINES  = 5;
+    private static final float EMA_ALPHA  = 0.20f;   // lower = smoother (less jitter)
 
     private final TrajectorySimulator simulator = new TrajectorySimulator();
-
-    private String shotMode = MODE_ALL;
-    private PointF targetPos;
-    private GameState detected;     // latest detected board state
-    private float marginOffsetX = 0f, marginOffsetY = 0f;
-    private float sensitivity = 1.0f;
+    private String    shotMode = MODE_ALL;
+    private GameState detected;
+    private GameState smoothed;
     private final float dp;
 
-    // Paints
-    private final Paint mainLinePaint, ghostPaint, coinPathPaint, queenPathPaint;
-    private final Paint goldenPaint, luckyPaint, pocketPathPaint;
-    private final Paint strikerOutlinePaint, coinOutlinePaint, pocketPaint;
-    private final Paint targetPaint, anglePaint, textPaint, boardPaint;
-    private final Paint blackPaint, whitePaint, redPaint;
+    private final Paint aimPaint, bouncePaint, bounce2Paint;
+    private final Paint coinPathPaint, pocketPathPaint;
+    private final Paint strikerPaint, coinOutlinePaint, pocketFill;
+    private final Paint boardPaint;
+    private final Paint blackFill, whiteFill, redFill;
+    private final Paint textPaint, watermarkPaint;
 
     public AimOverlayView(Context context) {
         super(context);
         dp = context.getResources().getDisplayMetrics().density;
 
-        mainLinePaint = stroke(Color.parseColor("#FFD700"), 3.5f); // yellow — striker direct
-        ghostPaint    = stroke(Color.parseColor("#CCFFFFFF"), 2.4f);
-        ghostPaint.setPathEffect(new DashPathEffect(new float[]{14*dp, 9*dp}, 0));
+        aimPaint        = stroke(0xFFFFD700, 3.5f);   // gold  — direct aim
+        bouncePaint     = stroke(0xFF00E5FF, 2.8f);   // cyan  — 1-wall bounce
+        bounce2Paint    = stroke(0xFFD946EF, 2.8f);   // magenta — 2-wall bounce
+        coinPathPaint   = stroke(0xFFFF8A00, 3.0f);   // orange — coin roll path
+        pocketPathPaint = stroke(0xFF22C55E, 4.0f);   // green — into pocket
 
-        coinPathPaint = stroke(Color.parseColor("#FF8A00"), 3.0f); // orange — coin trajectory
-        queenPathPaint = stroke(Color.parseColor("#FF3D71"), 3.0f); // pink — queen
-        goldenPaint   = stroke(Color.parseColor("#00E5FF"), 2.8f); // cyan — 1-bounce highlight
-        luckyPaint    = stroke(Color.parseColor("#D946EF"), 2.8f); // magenta — 2+ bounce
-        pocketPathPaint = stroke(Color.parseColor("#22C55E"), 4.0f); // green — leads into pocket
+        strikerPaint     = stroke(0xFFFFD700, 2.2f);
+        coinOutlinePaint = stroke(0x88FFFFFF, 1.5f);
+        pocketFill       = fill(0x882ECC71);
+        boardPaint       = stroke(0x44FFD700, 1.2f);
+        boardPaint.setPathEffect(new DashPathEffect(new float[]{6*dp, 6*dp}, 0));
 
-        strikerOutlinePaint = stroke(Color.parseColor("#FFD700"), 2f);
-        coinOutlinePaint    = stroke(Color.parseColor("#88FFFFFF"), 1.5f);
-        pocketPaint         = fill(Color.parseColor("#882ECC71"));
-
-        targetPaint = stroke(Color.parseColor("#FFFFFFFF"), 2f);
-        anglePaint  = stroke(Color.parseColor("#88FFFFFF"), 1.5f);
+        blackFill = fill(0x55000000);
+        whiteFill = fill(0x44FFFFFF);
+        redFill   = fill(0x55FF3D71);
 
         textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         textPaint.setColor(Color.WHITE);
         textPaint.setTextSize(12 * dp);
         textPaint.setShadowLayer(2 * dp, 0, 0, Color.BLACK);
 
-        boardPaint = stroke(Color.parseColor("#33FFD700"), 1.2f);
-        boardPaint.setPathEffect(new DashPathEffect(new float[]{6*dp, 6*dp}, 0));
-
-        whitePaint = fill(Color.parseColor("#33FFFFFF"));
-        blackPaint = fill(Color.parseColor("#33000000"));
-        redPaint   = fill(Color.parseColor("#33FF3D71"));
+        watermarkPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        watermarkPaint.setColor(0x33FFFFFF);
+        watermarkPaint.setTextSize(9 * dp);
+        watermarkPaint.setTextAlign(Paint.Align.CENTER);
+        watermarkPaint.setShadowLayer(1 * dp, 0, 0, Color.BLACK);
 
         setLayerType(LAYER_TYPE_SOFTWARE, null);
     }
 
     private Paint stroke(int color, float w) {
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setColor(color);
-        p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(w * dp);
-        p.setStrokeCap(Paint.Cap.ROUND);
-        p.setStrokeJoin(Paint.Join.ROUND);
-        return p;
+        p.setColor(color); p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(w * dp); p.setStrokeCap(Paint.Cap.ROUND);
+        p.setStrokeJoin(Paint.Join.ROUND); return p;
     }
     private Paint fill(int color) {
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setColor(color);
-        p.setStyle(Paint.Style.FILL);
-        return p;
+        p.setColor(color); p.setStyle(Paint.Style.FILL); return p;
     }
 
-    // ── Public API ───────────────────────────────────────────────────────────
+    public void setShotMode(String mode) { this.shotMode = mode; postInvalidate(); }
+    public void setMarginOffset(float dx, float dy) { /* auto calibrated */ }
+    public void setSensitivity(float v) { /* no longer used */ }
 
-    public void setShotMode(String mode)        { this.shotMode = mode; postInvalidate(); }
-    public void setMarginOffset(float dx, float dy) { this.marginOffsetX = dx; this.marginOffsetY = dy; postInvalidate(); }
-    public void setSensitivity(float v)         { this.sensitivity = Math.max(0.3f, Math.min(v, 3.0f)); postInvalidate(); }
-
-    /** Called by ScreenCaptureService when a new frame has been processed. */
     public void setDetectedState(GameState s) {
-        this.detected = s;
+        if (s == null) return;
+        detected = s;
+        applySmoothing(s);
         postInvalidate();
     }
 
-    // ── Touch — aim target only; striker is locked ───────────────────────────
+    // ── EMA smoothing ────────────────────────────────────────────────────────
 
-    @Override
-    public boolean onTouchEvent(MotionEvent event) {
-        switch (event.getAction()) {
-            case MotionEvent.ACTION_DOWN:
-            case MotionEvent.ACTION_MOVE:
-                targetPos = new PointF(
-                        event.getX() + marginOffsetX,
-                        event.getY() + marginOffsetY);
-                postInvalidate();
-                return true;
-            case MotionEvent.ACTION_UP:
-                postInvalidate();
-                return true;
+    private void applySmoothing(GameState raw) {
+        if (smoothed == null) { smoothed = raw; return; }
+        GameState out = new GameState();
+        out.board = smoothRect(smoothed.board, raw.board);
+
+        if (raw.striker != null) {
+            if (smoothed.striker != null) {
+                out.striker = new Coin(
+                    ema(smoothed.striker.pos.x, raw.striker.pos.x),
+                    ema(smoothed.striker.pos.y, raw.striker.pos.y),
+                    ema(smoothed.striker.radius, raw.striker.radius),
+                    Coin.COLOR_STRIKER, true);
+            } else {
+                out.striker = raw.striker;
+            }
         }
-        return super.onTouchEvent(event);
+        out.coins   = raw.coins;
+        out.pockets = raw.pockets.isEmpty() ? smoothed.pockets : raw.pockets;
+        smoothed = out;
     }
+
+    private RectF smoothRect(RectF p, RectF n) {
+        if (p == null) return n; if (n == null) return p;
+        return new RectF(ema(p.left,n.left), ema(p.top,n.top),
+                         ema(p.right,n.right), ema(p.bottom,n.bottom));
+    }
+    private float ema(float p, float n) { return p + EMA_ALPHA * (n - p); }
 
     // ── Draw ─────────────────────────────────────────────────────────────────
 
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        GameState s = smoothed != null ? smoothed : detected;
+        if (s == null || s.striker == null) return;
 
-        GameState s = detected;
-        // Fall back to a synthetic state so the UI is usable before screen capture is granted.
-        if (s == null) s = synthFallback();
-        if (s == null || s.striker == null) {
-            drawHint(canvas, "Waiting for board detection…");
-            return;
-        }
-
-        // Board outline (debug visual)
+        // Board outline + watermark
         if (s.board != null) {
             canvas.drawRect(s.board, boardPaint);
+            canvas.drawText("created by abraham / Xhay",
+                    s.board.centerX(), s.board.centerY(), watermarkPaint);
         }
 
         // Pockets
-        for (PointF p : s.pockets) {
-            canvas.drawCircle(p.x, p.y, 14 * dp, pocketPaint);
-        }
+        for (PointF p : s.pockets)
+            canvas.drawCircle(p.x, p.y, 13 * dp, pocketFill);
 
-        // Detected coins
+        // Coins
         for (Coin c : s.coins) {
-            Paint fill = (c.color == Coin.COLOR_BLACK) ? blackPaint
-                       : (c.color == Coin.COLOR_RED)   ? redPaint
-                                                       : whitePaint;
-            canvas.drawCircle(c.pos.x, c.pos.y, c.radius, fill);
+            Paint f = c.color == Coin.COLOR_BLACK ? blackFill
+                    : c.color == Coin.COLOR_RED   ? redFill : whiteFill;
+            canvas.drawCircle(c.pos.x, c.pos.y, c.radius, f);
             canvas.drawCircle(c.pos.x, c.pos.y, c.radius, coinOutlinePaint);
         }
 
-        // Striker (locked indicator — show it, but no drag)
-        canvas.drawCircle(s.striker.pos.x, s.striker.pos.y, s.striker.radius, whitePaint);
-        canvas.drawCircle(s.striker.pos.x, s.striker.pos.y, s.striker.radius, strikerOutlinePaint);
+        // Striker
+        canvas.drawCircle(s.striker.pos.x, s.striker.pos.y, s.striker.radius, whiteFill);
+        canvas.drawCircle(s.striker.pos.x, s.striker.pos.y, s.striker.radius, strikerPaint);
 
-        if (targetPos == null) {
-            drawHint(canvas, "Tap on the board to set aim target");
-            return;
+        // Top-5 auto aim shots
+        List<ShotCandidate> shots = computeBestShots(s);
+        int drawn = 0;
+        for (ShotCandidate shot : shots) {
+            if (drawn >= MAX_LINES) break;
+            drawShot(canvas, s, shot);
+            drawn++;
         }
+    }
 
-        // Target marker
-        canvas.drawCircle(targetPos.x, targetPos.y, 9 * dp, targetPaint);
-        canvas.drawLine(targetPos.x - 14*dp, targetPos.y, targetPos.x + 14*dp, targetPos.y, targetPaint);
-        canvas.drawLine(targetPos.x, targetPos.y - 14*dp, targetPos.x, targetPos.y + 14*dp, targetPaint);
+    // ── Shot candidates ───────────────────────────────────────────────────────
 
-        // Direct aim line — always drawn
-        canvas.drawLine(s.striker.pos.x, s.striker.pos.y, targetPos.x, targetPos.y, mainLinePaint);
-        drawAngleLabel(canvas, s.striker.pos, targetPos);
+    private static class ShotCandidate {
+        final PointF ghostPos;
+        final Coin   coin;
+        final PointF pocket;
+        final float  score;
+        ShotCandidate(PointF g, Coin c, PointF pk, float sc) {
+            ghostPos = g; coin = c; pocket = pk; score = sc;
+        }
+    }
 
-        // Run physics simulation
-        List<TrajectorySimulator.PathSegment> paths = simulator.simulate(
-                s.striker, targetPos, s.coins, s.pockets, s.board, sensitivity);
+    private List<ShotCandidate> computeBestShots(GameState s) {
+        List<ShotCandidate> list = new ArrayList<>();
+        if (s.pockets.isEmpty()) return list;
 
-        // Render each segment based on mode filter + bounce count
-        for (TrajectorySimulator.PathSegment seg : paths) {
-            if (!shouldDraw(seg)) continue;
-            Paint paint = paintFor(seg);
-            drawPolyline(canvas, seg.points, paint);
-            if (seg.enteredPocket && !seg.points.isEmpty()) {
-                PointF end = seg.points.get(seg.points.size() - 1);
-                canvas.drawCircle(end.x, end.y, 18 * dp, pocketPathPaint);
+        for (Coin coin : s.coins) {
+            if (coin.color == Coin.COLOR_STRIKER) continue;
+
+            // Find nearest pocket for this coin
+            PointF bestPocket = null;
+            float  bestDist   = Float.MAX_VALUE;
+            for (PointF pk : s.pockets) {
+                float d = dist(coin.pos, pk);
+                if (d < bestDist) { bestDist = d; bestPocket = pk; }
             }
+            if (bestPocket == null) continue;
+
+            // Ghost-ball position: striker must arrive here to send coin into pocket
+            float dx = coin.pos.x - bestPocket.x;
+            float dy = coin.pos.y - bestPocket.y;
+            float len = (float) Math.sqrt(dx*dx + dy*dy);
+            if (len < 1f) continue;
+            float ghostR = s.striker.radius + coin.radius;
+            PointF ghost = new PointF(
+                    coin.pos.x + (dx / len) * ghostR,
+                    coin.pos.y + (dy / len) * ghostR);
+
+            // Keep ghost inside board bounds
+            if (s.board != null && !s.board.contains(ghost.x, ghost.y)) continue;
+
+            float score = 800f / (dist(s.striker.pos, ghost) + 1f)
+                        + 400f / (bestDist + 1f);
+
+            // Queen (red) gets priority boost
+            if (coin.color == Coin.COLOR_RED) score *= 1.4f;
+
+            list.add(new ShotCandidate(ghost, coin, bestPocket, score));
+        }
+
+        Collections.sort(list, (a, b) -> Float.compare(b.score, a.score));
+        return list;
+    }
+
+    private void drawShot(Canvas canvas, GameState s, ShotCandidate shot) {
+        // Aim line: striker → ghost position
+        canvas.drawLine(s.striker.pos.x, s.striker.pos.y,
+                shot.ghostPos.x, shot.ghostPos.y, aimPaint);
+
+        // Ghost ball circle at contact point
+        canvas.drawCircle(shot.ghostPos.x, shot.ghostPos.y,
+                s.striker.radius, coinOutlinePaint);
+
+        // Coin-to-pocket line
+        if (shot.coin != null && shot.pocket != null) {
+            canvas.drawLine(shot.coin.pos.x, shot.coin.pos.y,
+                    shot.pocket.x, shot.pocket.y, coinPathPaint);
+            canvas.drawCircle(shot.pocket.x, shot.pocket.y, 16*dp, pocketPathPaint);
+        }
+
+        // Physics simulation for striker path after contact
+        List<TrajectorySimulator.PathSegment> segs = simulator.simulate(
+                s.striker, shot.ghostPos, s.coins, s.pockets, s.board, 1.0f);
+        int segDrawn = 0;
+        for (TrajectorySimulator.PathSegment seg : segs) {
+            if (segDrawn >= 2) break;
+            drawPolyline(canvas, seg.points, paintForSeg(seg));
+            segDrawn++;
         }
     }
 
-    private boolean shouldDraw(TrajectorySimulator.PathSegment seg) {
-        if (MODE_ALL.equals(shotMode))    return true;
-        if (MODE_DIRECT.equals(shotMode)) return seg.kind == 0 && seg.wallBounces == 0;
-        if (MODE_AI.equals(shotMode))     return true;
-        if (MODE_GOLDEN.equals(shotMode)) return seg.wallBounces <= 1;
-        if (MODE_LUCKY.equals(shotMode))  return seg.wallBounces <= 2;
-        return true;
-    }
-
-    private Paint paintFor(TrajectorySimulator.PathSegment seg) {
+    private Paint paintForSeg(TrajectorySimulator.PathSegment seg) {
         if (seg.enteredPocket)  return pocketPathPaint;
-        if (seg.kind == 0)      return seg.wallBounces == 0 ? ghostPaint
-                                  : (seg.wallBounces == 1 ? goldenPaint : luckyPaint);
-        if (seg.kind == 3)      return queenPathPaint;
-        return coinPathPaint;
+        if (seg.wallBounces == 0) return aimPaint;
+        if (seg.wallBounces == 1) return bouncePaint;
+        return bounce2Paint;
     }
 
     private void drawPolyline(Canvas c, List<PointF> pts, Paint p) {
-        if (pts.size() < 2) return;
-        for (int i = 1; i < pts.size(); i++) {
-            PointF a = pts.get(i - 1), b = pts.get(i);
-            c.drawLine(a.x, a.y, b.x, b.y, p);
-        }
+        for (int i = 1; i < pts.size(); i++)
+            c.drawLine(pts.get(i-1).x, pts.get(i-1).y, pts.get(i).x, pts.get(i).y, p);
     }
 
-    private void drawAngleLabel(Canvas canvas, PointF from, PointF to) {
-        double angle = Math.toDegrees(Math.atan2(to.y - from.y, to.x - from.x));
-        if (angle < 0) angle += 360;
-        canvas.drawText(String.format("%.1f°", angle),
-                (from.x + to.x) / 2f + 10 * dp,
-                (from.y + to.y) / 2f - 8 * dp,
-                textPaint);
-    }
-
-    private void drawHint(Canvas canvas, String msg) {
-        canvas.drawText(msg, 24 * dp, 60 * dp, textPaint);
-    }
-
-    /**
-     * Synthesize a placeholder GameState before MediaProjection is granted, so the
-     * overlay still shows something useful when the user is just demoing the app.
-     * Once real detection kicks in, this is overwritten on the next frame.
-     */
-    private GameState synthFallback() {
-        if (getWidth() == 0 || getHeight() == 0) return null;
-        GameState s = new GameState();
-        int w = getWidth(), h = getHeight();
-        float side = Math.min(w, h) * 0.92f;
-        float cx = w / 2f, cy = h / 2f;
-        s.board = new RectF(cx - side/2f, cy - side/2f, cx + side/2f, cy + side/2f);
-        s.pockets.add(new PointF(s.board.left + 24*dp, s.board.top + 24*dp));
-        s.pockets.add(new PointF(s.board.right - 24*dp, s.board.top + 24*dp));
-        s.pockets.add(new PointF(s.board.left + 24*dp, s.board.bottom - 24*dp));
-        s.pockets.add(new PointF(s.board.right - 24*dp, s.board.bottom - 24*dp));
-        // Place a few demo coins around center
-        s.coins = new ArrayList<>();
-        float r = 14 * dp;
-        for (int i = -2; i <= 2; i++) {
-            for (int j = -1; j <= 1; j++) {
-                if (i == 0 && j == 0) continue;
-                int color = ((i + j) & 1) == 0 ? Coin.COLOR_BLACK : Coin.COLOR_WHITE;
-                s.coins.add(new Coin(cx + i * 38*dp, cy + j * 38*dp, r, color, false));
-            }
-        }
-        s.coins.add(new Coin(cx, cy, r, Coin.COLOR_RED, false));
-        s.striker = new Coin(cx, s.board.bottom - 80*dp, 16*dp, Coin.COLOR_STRIKER, true);
-        return s;
+    private float dist(PointF a, PointF b) {
+        float dx = a.x-b.x, dy = a.y-b.y;
+        return (float) Math.sqrt(dx*dx+dy*dy);
     }
 }

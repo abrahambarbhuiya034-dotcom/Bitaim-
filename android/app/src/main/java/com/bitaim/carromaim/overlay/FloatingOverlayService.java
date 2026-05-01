@@ -6,15 +6,21 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.Typeface;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
@@ -24,32 +30,38 @@ import com.bitaim.carromaim.R;
 import com.bitaim.carromaim.cv.GameState;
 
 /**
- * FloatingOverlayService
+ * FloatingOverlayService — v3
  *
- * Foreground service that owns:
- *   1. A small draggable floating button (toggle aim overlay)
- *   2. The transparent AimOverlayView covering the whole screen
- *
- * The screen-capture pipeline (ScreenCaptureService) pushes detected GameState
- * here via onDetectedState(), which forwards to the overlay view.
+ * Changes:
+ *  - Tapping the floating icon shows a small popup with a "Turn ON / Turn OFF"
+ *    button instead of toggling directly.
+ *  - The AimOverlayView is fully pass-through (FLAG_NOT_TOUCHABLE | FLAG_NOT_FOCUSABLE)
+ *    so it never intercepts touches to the game.
+ *  - App name updated to AIMxASSIST.
  */
 public class FloatingOverlayService extends Service {
 
-    private static final String CHANNEL_ID = "bitaim_channel";
-    private static final int NOTIF_ID = 1001;
+    private static final String CHANNEL_ID = "aimxassist_channel";
+    private static final int    NOTIF_ID   = 1001;
 
     public static volatile FloatingOverlayService INSTANCE;
 
     private WindowManager windowManager;
-    private View floatingBtnView;
+    private View          floatingBtnView;
     private AimOverlayView aimOverlayView;
+    private View          popupView;           // small toggle popup
 
     private WindowManager.LayoutParams floatingBtnParams;
     private WindowManager.LayoutParams overlayParams;
+    private WindowManager.LayoutParams popupParams;
 
-    private float touchStartX, touchStartY;
-    private int viewStartX, viewStartY;
+    private float   touchStartX, touchStartY;
+    private int     viewStartX,  viewStartY;
     private boolean overlayVisible = false;
+    private boolean popupShowing   = false;
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private float dp;
 
     @Nullable @Override
     public IBinder onBind(Intent intent) { return null; }
@@ -58,6 +70,7 @@ public class FloatingOverlayService extends Service {
     public void onCreate() {
         super.onCreate();
         INSTANCE = this;
+        dp = getResources().getDisplayMetrics().density;
         createNotificationChannel();
         startForeground(NOTIF_ID, buildNotification());
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
@@ -65,19 +78,17 @@ public class FloatingOverlayService extends Service {
         setupAimOverlay();
     }
 
-    // ── Floating button ──────────────────────────────────────────────────────
+    // ── Floating button ───────────────────────────────────────────────────────
+
     private void setupFloatingButton() {
         floatingBtnView = LayoutInflater.from(this)
                 .inflate(R.layout.view_floating_button, null);
 
-        int overlayType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                : WindowManager.LayoutParams.TYPE_PHONE;
-
+        int type = overlayType();
         floatingBtnParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
-                overlayType,
+                type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
         floatingBtnParams.gravity = Gravity.TOP | Gravity.START;
@@ -85,26 +96,27 @@ public class FloatingOverlayService extends Service {
         floatingBtnParams.y = 300;
 
         floatingBtnView.setOnTouchListener(new View.OnTouchListener() {
-            boolean wasDrag = false;
-            @Override public boolean onTouch(View v, MotionEvent event) {
-                switch (event.getAction()) {
+            boolean wasDrag;
+            @Override public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getAction()) {
                     case MotionEvent.ACTION_DOWN:
-                        touchStartX = event.getRawX();
-                        touchStartY = event.getRawY();
-                        viewStartX = floatingBtnParams.x;
-                        viewStartY = floatingBtnParams.y;
+                        touchStartX = e.getRawX(); touchStartY = e.getRawY();
+                        viewStartX = floatingBtnParams.x; viewStartY = floatingBtnParams.y;
                         wasDrag = false;
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        float dx = event.getRawX() - touchStartX;
-                        float dy = event.getRawY() - touchStartY;
-                        if (Math.abs(dx) > 5 || Math.abs(dy) > 5) wasDrag = true;
-                        floatingBtnParams.x = (int) (viewStartX + dx);
-                        floatingBtnParams.y = (int) (viewStartY + dy);
+                        float dx = e.getRawX() - touchStartX;
+                        float dy = e.getRawY() - touchStartY;
+                        if (Math.abs(dx) > 8 || Math.abs(dy) > 8) wasDrag = true;
+                        floatingBtnParams.x = (int)(viewStartX + dx);
+                        floatingBtnParams.y = (int)(viewStartY + dy);
                         windowManager.updateViewLayout(floatingBtnView, floatingBtnParams);
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (!wasDrag) toggleAimOverlay();
+                        if (!wasDrag) {
+                            if (popupShowing) dismissPopup();
+                            else showTogglePopup();
+                        }
                         return true;
                 }
                 return false;
@@ -113,22 +125,72 @@ public class FloatingOverlayService extends Service {
         windowManager.addView(floatingBtnView, floatingBtnParams);
     }
 
-    private void setupAimOverlay() {
-        aimOverlayView = new AimOverlayView(this);
-        int overlayType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                : WindowManager.LayoutParams.TYPE_PHONE;
-        overlayParams = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                overlayType,
+    // ── Toggle popup ──────────────────────────────────────────────────────────
+
+    private void showTogglePopup() {
+        if (popupShowing) return;
+        popupShowing = true;
+
+        // Build popup programmatically
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setBackgroundColor(0xDD111111);
+        int pad = (int)(12 * dp);
+        ll.setPadding(pad, pad, pad, pad);
+
+        // Title
+        TextView title = new TextView(this);
+        title.setText("AIMxASSIST");
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextColor(Color.parseColor("#FFD700"));
+        title.setTextSize(13);
+        title.setGravity(Gravity.CENTER_HORIZONTAL);
+        ll.addView(title);
+
+        // Toggle button
+        TextView btn = new TextView(this);
+        btn.setText(overlayVisible ? "⬛  Turn OFF" : "▶  Turn ON");
+        btn.setTextColor(overlayVisible ? 0xFFFF6B6B : 0xFF22C55E);
+        btn.setTextSize(15);
+        btn.setTypeface(Typeface.DEFAULT_BOLD);
+        btn.setGravity(Gravity.CENTER_HORIZONTAL);
+        btn.setPadding(pad*2, pad, pad*2, pad);
+        btn.setOnClickListener(vv -> {
+            toggleAimOverlay();
+            dismissPopup();
+        });
+        ll.addView(btn);
+
+        // Dismiss on outside tap (handled by FLAG_WATCH_OUTSIDE_TOUCH + listener)
+        popupView = ll;
+        popupParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                overlayType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
                 PixelFormat.TRANSLUCENT);
-        aimOverlayView.setVisibility(View.GONE);
-        windowManager.addView(aimOverlayView, overlayParams);
+        popupParams.gravity = Gravity.TOP | Gravity.START;
+        popupParams.x = floatingBtnParams.x + (int)(60 * dp);
+        popupParams.y = floatingBtnParams.y;
+        popupView.setOnTouchListener((v, e) -> {
+            if (e.getAction() == MotionEvent.ACTION_OUTSIDE) dismissPopup();
+            return false;
+        });
+        windowManager.addView(popupView, popupParams);
+
+        // Auto-dismiss after 4 s
+        handler.postDelayed(this::dismissPopup, 4000);
+    }
+
+    private void dismissPopup() {
+        if (!popupShowing) return;
+        popupShowing = false;
+        handler.removeCallbacksAndMessages(null);
+        try {
+            if (popupView != null) windowManager.removeView(popupView);
+        } catch (Exception ignored) {}
+        popupView = null;
     }
 
     public void toggleAimOverlay() {
@@ -138,17 +200,44 @@ public class FloatingOverlayService extends Service {
         if (icon != null) icon.setAlpha(overlayVisible ? 1.0f : 0.5f);
     }
 
-    // ── External API ─────────────────────────────────────────────────────────
-    public void setShotMode(String mode)         { if (aimOverlayView != null) aimOverlayView.setShotMode(mode); }
-    public void setMarginOffset(float dx, float dy) { if (aimOverlayView != null) aimOverlayView.setMarginOffset(dx, dy); }
-    public void setSensitivity(float value)      { if (aimOverlayView != null) aimOverlayView.setSensitivity(value); }
-    public void onDetectedState(GameState s)     { if (aimOverlayView != null) aimOverlayView.setDetectedState(s); }
+    // ── Aim overlay — fully pass-through ─────────────────────────────────────
 
-    // ── Notification ─────────────────────────────────────────────────────────
+    private void setupAimOverlay() {
+        aimOverlayView = new AimOverlayView(this);
+        overlayParams  = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                overlayType(),
+                // NOT_TOUCHABLE = overlay never intercepts game touches
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        aimOverlayView.setVisibility(View.GONE);
+        windowManager.addView(aimOverlayView, overlayParams);
+    }
+
+    // ── External API ──────────────────────────────────────────────────────────
+
+    public void setShotMode(String mode)            { if (aimOverlayView != null) aimOverlayView.setShotMode(mode); }
+    public void setMarginOffset(float dx, float dy) { /* auto calibrated */ }
+    public void setSensitivity(float value)         { /* removed */ }
+    public void onDetectedState(GameState s)        { if (aimOverlayView != null) aimOverlayView.setDetectedState(s); }
+
+    // ── Notification ──────────────────────────────────────────────────────────
+
+    private int overlayType() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+    }
+
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "Bit-Aim Running", NotificationManager.IMPORTANCE_LOW);
+                    CHANNEL_ID, "AIMxASSIST Running", NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("Aim assist overlay is active");
             NotificationManager nm = getSystemService(NotificationManager.class);
             if (nm != null) nm.createNotificationChannel(ch);
@@ -161,10 +250,10 @@ public class FloatingOverlayService extends Service {
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
                 ? PendingIntent.FLAG_IMMUTABLE : 0;
         PendingIntent stopPi = PendingIntent.getService(this, 0, stopIntent, piFlags);
-        Intent openIntent = new Intent(this, MainActivity.class);
+        Intent openIntent   = new Intent(this, MainActivity.class);
         PendingIntent openPi = PendingIntent.getActivity(this, 1, openIntent, piFlags);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("Bit-Aim Running")
+                .setContentTitle("AIMxASSIST Active")
                 .setContentText("Tap floating icon in game to toggle aim lines")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentIntent(openPi)
@@ -184,7 +273,8 @@ public class FloatingOverlayService extends Service {
     public void onDestroy() {
         super.onDestroy();
         INSTANCE = null;
+        dismissPopup();
         try { if (floatingBtnView != null) windowManager.removeView(floatingBtnView); } catch (Exception ignored) {}
-        try { if (aimOverlayView  != null) windowManager.removeView(aimOverlayView); }  catch (Exception ignored) {}
+        try { if (aimOverlayView  != null) windowManager.removeView(aimOverlayView);  } catch (Exception ignored) {}
     }
 }

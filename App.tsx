@@ -1,14 +1,11 @@
 /**
- * BitAim - Carrom Pool Aim Assistant
- * Main React Native UI
+ * AIMxASSIST - Carrom Pool Aim Assistant
+ * Main React Native UI — v3.0
  *
- * v2.0 changes
- *  - Auto-detection: striker / coins / pockets are found by computer vision
- *    on captured screen frames (MediaProjection + OpenCV). No manual placement.
- *  - Striker is locked — touching it no longer drags it.
- *  - Multi-line prediction: every shot type renders simultaneously
- *    (direct, coin trajectory, coin-on-coin chain, 1-cushion, 2-cushion bounces).
- *  - Pocket prediction: any path that ends in a pocket is highlighted green.
+ * - Fully automatic aim lines, no touch needed
+ * - Board auto-detected via wood-colour CV (no manual margin needed)
+ * - Max 5 prediction lines, EMA-smoothed for stability
+ * - Watermark: created by abraham / Xhay
  */
 
 import React, {useState, useEffect, useCallback} from 'react';
@@ -163,9 +160,9 @@ export default function App() {
       <StatusBar barStyle="light-content" backgroundColor="#0D0D1A" />
 
       <View style={styles.header}>
-        <Text style={styles.logo}>Bit-Aim</Text>
+        <Text style={styles.logo}>AIMxASSIST</Text>
         <Text style={styles.subtitle}>
-          Auto-Detect Carrom Aim Assist • v2.0
+          Auto-Detect Carrom Aim Assist • v3.0
         </Text>
       </View>
 
@@ -338,19 +335,20 @@ export default function App() {
           <Text style={styles.cardTitle}>How to Use</Text>
           <Text style={styles.howToStep}>1. Grant "Draw over apps" permission</Text>
           <Text style={styles.howToStep}>2. Turn on the Aim Overlay</Text>
-          <Text style={styles.howToStep}>3. Turn on Auto-Detect (grant screen capture each session)</Text>
+          <Text style={styles.howToStep}>3. Turn on Auto-Detect (grant screen capture — asked once per session)</Text>
           <Text style={styles.howToStep}>4. Open Carrom Pool</Text>
-          <Text style={styles.howToStep}>5. Tap the floating icon to toggle aim lines</Text>
-          <Text style={styles.howToStep}>6. Touch the board to set the aim target</Text>
-          <Text style={styles.howToStep}>7. Watch the multi-line prediction update in real time</Text>
+          <Text style={styles.howToStep}>5. Tap the floating icon → tap "Turn ON"</Text>
+          <Text style={styles.howToStep}>6. Aim lines appear automatically — no touch needed</Text>
+          <Text style={styles.howToStep}>7. Up to 5 best shots are shown, updating every ~30 FPS</Text>
           <Text style={styles.howToTip}>
-            Tip: striker is locked — it follows what the camera detects, no
-            dragging. If detection misses pieces, lower "Detection Sensitivity".
+            Tip: the board is auto-detected by wood colour — if lines appear
+            outside the board, lower "Detection Sensitivity" slightly.
+            Watermark "created by abraham / Xhay" shows at board centre.
           </Text>
         </View>
 
         <View style={styles.footer}>
-          <Text style={styles.footerText}>Bit-Aim v2.0 • Auto-Detect • Android 6+</Text>
+          <Text style={styles.footerText}>AIMxASSIST v3.0 • Auto-Detect • Android 6+</Text>
         </View>
       </ScrollView>
     </View>
