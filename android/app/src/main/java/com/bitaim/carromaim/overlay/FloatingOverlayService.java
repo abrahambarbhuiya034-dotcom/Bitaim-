@@ -230,7 +230,13 @@ public class FloatingOverlayService extends Service {
     public void setShotMode(String mode)            { if (aimOverlayView != null) aimOverlayView.setShotMode(mode); }
     public void setMarginOffset(float dx, float dy) { /* auto calibrated */ }
     public void setSensitivity(float value)         { /* removed */ }
-    public void onDetectedState(GameState s)        { if (aimOverlayView != null) aimOverlayView.setDetectedState(s); }
+    public void onDetectedState(GameState s)        {
+        latestState = s;
+        if (aimOverlayView != null) aimOverlayView.setDetectedState(s);
+    }
+
+    private volatile GameState latestState;
+    public GameState getLatestState() { return latestState; }
 
     // ── Notification ──────────────────────────────────────────────────────────
 
