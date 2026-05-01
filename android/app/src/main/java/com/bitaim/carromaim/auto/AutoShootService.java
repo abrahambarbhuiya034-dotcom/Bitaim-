@@ -74,8 +74,9 @@ public class AutoShootService extends AccessibilityService {
         float ny = dy / len;
 
         // Swipe: start at striker, flick toward target.
-        // Longer swipe = harder shot. Range: 80 px (soft) to 280 px (hard).
-        float swipeDist = 80f + powerFrac * 200f;
+        // Adaptive range: 120 px (soft, power=0.35) to 360 px (hard, power=1.0)
+        // Increased from v7 (80+200) → stronger, more physically accurate shots.
+        float swipeDist = 120f + powerFrac * 240f;
 
         float fromX = strikerX;
         float fromY = strikerY;

@@ -33,32 +33,38 @@ import androidx.core.app.NotificationCompat;
 import com.bitaim.carromaim.MainActivity;
 import com.bitaim.carromaim.R;
 import com.bitaim.carromaim.auto.AutoShootService;
+import com.bitaim.carromaim.cv.CarromAI;
 import com.bitaim.carromaim.cv.Coin;
 import com.bitaim.carromaim.cv.GameState;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 /**
- * FloatingOverlayService — v7.0
+ * FloatingOverlayService — v8.0 RESPONSIVE AUTOPLAY
  *
- * Key fixes vs v5:
- *  1. AUTOPLAY EXIT BUG FIXED — autoplay now fires ONLY when:
- *       a) Real live CV data is flowing (hasLiveData guard)
- *       b) The board has been stable for STABLE_FRAMES_NEEDED consecutive
- *          frames (pieces not moving)
- *       c) A cooldown of SHOOT_COOLDOWN_MS has passed since the last shot
- *     This means autoplay CANNOT fire while the user is on the AIMxASSIST
- *     app, because the board detector will not see a stable carrom board.
+ * Key upgrades vs v7:
  *
- *  2. Demo state uses setDemoState() instead of setDetectedState() so it
- *     does NOT set hasLiveData and does NOT enable autoplay.
+ *  § Responsiveness
+ *    - STABLE_FRAMES_NEEDED reduced from 20 → 10 (fires ~2× faster)
+ *    - SHOOT_COOLDOWN_MS    reduced from 3500 → 1800
+ *    - Physics-validated shot (CarromAI.findBestShotPhysics) is pre-computed
+ *      on a single background thread so it is ready by the time the board
+ *      is stable — zero wait on the main thread.
+ *    - Shot pre-fetch triggered after 3 stable frames; fires at 10.
  *
- *  3. Removed the duplicate timer-based autoplay from AimOverlayView —
- *     all autoplay is now driven exclusively from here via handleAutoPlay()
- *     which requires real CV data + stability + cooldown.
+ *  § Physics power
+ *    - AutoShootService.shoot() receives AiShot.powerFrac (adaptive per-shot)
+ *      instead of a hardcoded 0.75f — gestures are now calibrated to distance.
  *
- *  4. setAutoPlay() no longer calls aimOverlayView.setAutoplay() (removed
- *     the timer-based API). It just sets the local flag.
+ *  § Safety
+ *    - hasLiveData guard kept — demo state never fires.
+ *    - Foul-safety and path-clearance from CarromAI v8 guarantee no self-pot.
  *
- *  5. Popup correctly shows live status of autoplay.
+ *  § Demo
+ *    - Richer 12-piece demo layout; uses setDemoState() (not setDetectedState).
  */
 public class FloatingOverlayService extends Service {
 
@@ -66,13 +72,15 @@ public class FloatingOverlayService extends Service {
     private static final String CHANNEL_ID = "aimxassist_channel";
     private static final int    NOTIF_ID   = 1001;
 
-    // Board must be stable (pieces not moving) for this many consecutive
-    // frames before autoplay fires a shot.
-    private static final int   STABLE_FRAMES_NEEDED = 20;
-    private static final float STABLE_THRESH_PX     = 12f;
-
-    // Minimum milliseconds between autoplay shots
-    private static final long  SHOOT_COOLDOWN_MS    = 3500;
+    // ── Responsiveness tuning ─────────────────────────────────────────────────
+    /** Consecutive stable frames before a shot fires (lower = more responsive). */
+    private static final int   STABLE_FRAMES_NEEDED = 10;
+    /** Start pre-computing physics shot after this many stable frames. */
+    private static final int   PREFETCH_FRAMES      = 3;
+    /** Max striker movement (screen px) to count as "stable". */
+    private static final float STABLE_THRESH_PX     = 10f;
+    /** Minimum ms gap between shots. */
+    private static final long  SHOOT_COOLDOWN_MS    = 1800L;
 
     public static volatile FloatingOverlayService INSTANCE;
 
@@ -95,9 +103,16 @@ public class FloatingOverlayService extends Service {
     private float   lastStrikerX    = Float.NaN;
     private float   lastStrikerY    = Float.NaN;
     private long    lastShootTimeMs = 0L;
-    private int     autoPlayDelayMs = 2000;  // mirrors user-set delay
+    private int     autoPlayDelayMs = 1800;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    // ── Background physics computation ────────────────────────────────────────
+    private final ExecutorService physicsThread = Executors.newSingleThreadExecutor();
+    private volatile Future<?>    physicsFuture;
+    private volatile CarromAI.AiShot precomputedShot;
+    private volatile GameState       precomputedState;
+    private final AtomicBoolean      computing = new AtomicBoolean(false);
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private float dp;
 
     @Nullable @Override public IBinder onBind(Intent intent) { return null; }
@@ -108,46 +123,46 @@ public class FloatingOverlayService extends Service {
         INSTANCE = this;
         dp = getResources().getDisplayMetrics().density;
         createNotificationChannel();
-        Notification notif = buildNotification();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            startForeground(NOTIF_ID, buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         } else {
-            startForeground(NOTIF_ID, notif);
+            startForeground(NOTIF_ID, buildNotification());
         }
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         setupAimOverlay();
         setupFloatingButton();
-        // Demo state: uses setDemoState (does NOT enable autoplay triggers)
-        handler.postDelayed(this::injectDemoState, 400);
+        mainHandler.postDelayed(this::injectDemoState, 400);
     }
 
-    // ── Demo state (visual only — does NOT enable autoplay) ────────────────────
+    // ── Demo state ────────────────────────────────────────────────────────────
 
     private void injectDemoState() {
         if (aimOverlayView == null) return;
         DisplayMetrics dm = getResources().getDisplayMetrics();
-        int w = dm.widthPixels;
-        int h = dm.heightPixels;
-
+        int w = dm.widthPixels, h = dm.heightPixels;
         GameState s = new GameState();
-        float side = w * 0.80f;
-        float cx   = w / 2f;
-        float cy   = h * 0.44f;
-        s.board = new RectF(cx - side/2f, cy - side/2f, cx + side/2f, cy + side/2f);
-
+        float side = w * 0.80f, cx = w/2f, cy = h * 0.44f;
+        s.board = new RectF(cx-side/2f, cy-side/2f, cx+side/2f, cy+side/2f);
         float r = side * 0.024f;
-        s.striker = new Coin(cx, cy + side * 0.34f, r * 1.15f, Coin.COLOR_STRIKER, true);
+        s.striker = new Coin(cx, cy+side*0.34f, r*1.15f, Coin.COLOR_STRIKER, true);
 
-        s.coins.add(new Coin(cx,               cy,              r,     Coin.COLOR_RED,   false));
-        s.coins.add(new Coin(cx - side*0.10f,  cy - side*0.06f, r,     Coin.COLOR_WHITE, false));
-        s.coins.add(new Coin(cx + side*0.10f,  cy - side*0.06f, r,     Coin.COLOR_WHITE, false));
-        s.coins.add(new Coin(cx - side*0.19f,  cy + side*0.09f, r,     Coin.COLOR_WHITE, false));
-        s.coins.add(new Coin(cx + side*0.19f,  cy + side*0.09f, r,     Coin.COLOR_WHITE, false));
-        s.coins.add(new Coin(cx,               cy - side*0.21f, r,     Coin.COLOR_WHITE, false));
-        s.coins.add(new Coin(cx - side*0.07f,  cy + side*0.07f, r,     Coin.COLOR_BLACK, false));
-        s.coins.add(new Coin(cx + side*0.07f,  cy + side*0.07f, r,     Coin.COLOR_BLACK, false));
-        s.coins.add(new Coin(cx - side*0.23f,  cy - side*0.11f, r,     Coin.COLOR_BLACK, false));
-        s.coins.add(new Coin(cx + side*0.23f,  cy - side*0.11f, r,     Coin.COLOR_BLACK, false));
+        float[][] coins = {
+            {cx,              cy,              0, Coin.COLOR_RED},
+            {cx-side*.10f,    cy-side*.07f,    0, Coin.COLOR_WHITE},
+            {cx+side*.10f,    cy-side*.07f,    0, Coin.COLOR_WHITE},
+            {cx-side*.20f,    cy+side*.08f,    0, Coin.COLOR_WHITE},
+            {cx+side*.20f,    cy+side*.08f,    0, Coin.COLOR_WHITE},
+            {cx,              cy-side*.21f,    0, Coin.COLOR_WHITE},
+            {cx-side*.07f,    cy+side*.08f,    0, Coin.COLOR_BLACK},
+            {cx+side*.07f,    cy+side*.08f,    0, Coin.COLOR_BLACK},
+            {cx-side*.24f,    cy-side*.12f,    0, Coin.COLOR_BLACK},
+            {cx+side*.24f,    cy-side*.12f,    0, Coin.COLOR_BLACK},
+            {cx-side*.16f,    cy+side*.18f,    0, Coin.COLOR_BLACK},
+            {cx+side*.16f,    cy+side*.18f,    0, Coin.COLOR_BLACK},
+        };
+        for (float[] c : coins)
+            s.coins.add(new Coin(c[0], c[1], r, (int)c[3], false));
 
         float inset = side * 0.035f;
         s.pockets.add(new PointF(s.board.left  + inset, s.board.top    + inset));
@@ -155,17 +170,15 @@ public class FloatingOverlayService extends Service {
         s.pockets.add(new PointF(s.board.left  + inset, s.board.bottom - inset));
         s.pockets.add(new PointF(s.board.right - inset, s.board.bottom - inset));
 
-        // KEY FIX: use setDemoState, not setDetectedState
-        // This keeps hasLiveData = false so autoplay cannot fire on demo data
+        // KEY: setDemoState — does NOT set hasLiveData, autoplay safe
         aimOverlayView.setDemoState(s);
     }
 
-    // ── Floating button ─────────────────────────────────────────────────────────
+    // ── Floating button ───────────────────────────────────────────────────────
 
     private void setupFloatingButton() {
         floatingBtnView = LayoutInflater.from(this)
                 .inflate(R.layout.view_floating_button, null);
-
         floatingBtnParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -173,8 +186,7 @@ public class FloatingOverlayService extends Service {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
         floatingBtnParams.gravity = Gravity.TOP | Gravity.START;
-        floatingBtnParams.x = 16;
-        floatingBtnParams.y = 280;
+        floatingBtnParams.x = 16; floatingBtnParams.y = 280;
 
         floatingBtnView.setOnTouchListener(new View.OnTouchListener() {
             boolean wasDrag;
@@ -182,21 +194,18 @@ public class FloatingOverlayService extends Service {
                 switch (e.getAction()) {
                     case MotionEvent.ACTION_DOWN:
                         touchStartX = e.getRawX(); touchStartY = e.getRawY();
-                        viewStartX  = floatingBtnParams.x;
-                        viewStartY  = floatingBtnParams.y;
+                        viewStartX = floatingBtnParams.x; viewStartY = floatingBtnParams.y;
                         wasDrag = false; return true;
                     case MotionEvent.ACTION_MOVE:
-                        float dx = e.getRawX() - touchStartX;
-                        float dy = e.getRawY() - touchStartY;
-                        if (Math.abs(dx) > 8 || Math.abs(dy) > 8) wasDrag = true;
-                        floatingBtnParams.x = (int)(viewStartX + dx);
-                        floatingBtnParams.y = (int)(viewStartY + dy);
+                        float dx = e.getRawX()-touchStartX, dy = e.getRawY()-touchStartY;
+                        if (Math.abs(dx)>8||Math.abs(dy)>8) wasDrag = true;
+                        floatingBtnParams.x = (int)(viewStartX+dx);
+                        floatingBtnParams.y = (int)(viewStartY+dy);
                         windowManager.updateViewLayout(floatingBtnView, floatingBtnParams);
                         return true;
                     case MotionEvent.ACTION_UP:
                         if (!wasDrag) {
-                            if (popupShowing) dismissPopup();
-                            else showTogglePopup();
+                            if (popupShowing) dismissPopup(); else showTogglePopup();
                         }
                         return true;
                 }
@@ -215,34 +224,36 @@ public class FloatingOverlayService extends Service {
         LinearLayout ll = new LinearLayout(this);
         ll.setOrientation(LinearLayout.VERTICAL);
         ll.setBackgroundColor(0xF2111122);
-        int pad = (int)(13 * dp);
+        int pad = (int)(13*dp);
         ll.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("AIMxASSIST");
+        title.setText("AIMxASSIST v8");
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.parseColor("#FFD700"));
         title.setTextSize(14);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
-        title.setPadding(0, 0, 0, (int)(6 * dp));
+        title.setPadding(0,0,0,(int)(6*dp));
         ll.addView(title);
 
-        addPopupRow(ll, pad,
+        addPopupBtn(ll, pad,
                 overlayVisible ? "Lines OFF" : "Lines ON",
                 overlayVisible ? 0xFFFF5555 : 0xFF22DD55,
                 v -> { toggleAimOverlay(); dismissPopup(); });
 
-        addPopupRow(ll, pad,
-                autoPlayEnabled ? "AutoPlay OFF" : "AutoPlay ON",
+        addPopupBtn(ll, pad,
+                autoPlayEnabled
+                    ? "AutoPlay OFF"
+                    : (AutoShootService.isReady() ? "AutoPlay ON" : "Need Accessibility"),
                 autoPlayEnabled ? 0xFFFF5555 : 0xFF6699FF,
                 v -> { toggleAutoPlayFromPopup(); dismissPopup(); });
 
-        if (autoPlayEnabled && !AutoShootService.isReady()) {
+        if (autoPlayEnabled) {
             TextView hint = new TextView(this);
-            hint.setText("Enable Accessibility\nin Settings first!");
-            hint.setTextColor(0xFFFF8A00); hint.setTextSize(11);
+            hint.setText("Physics AI active\nFires on stable board");
+            hint.setTextColor(0xFF22DD55); hint.setTextSize(11);
             hint.setGravity(Gravity.CENTER_HORIZONTAL);
-            hint.setPadding(0, (int)(5 * dp), 0, 0);
+            hint.setPadding(0,(int)(5*dp),0,0);
             ll.addView(hint);
         }
 
@@ -255,70 +266,46 @@ public class FloatingOverlayService extends Service {
                         | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
                 PixelFormat.TRANSLUCENT);
         popupParams.gravity = Gravity.TOP | Gravity.START;
-        popupParams.x = floatingBtnParams.x + (int)(60 * dp);
+        popupParams.x = floatingBtnParams.x + (int)(60*dp);
         popupParams.y = floatingBtnParams.y;
         popupView.setOnTouchListener((v, e) -> {
             if (e.getAction() == MotionEvent.ACTION_OUTSIDE) dismissPopup();
             return false;
         });
         windowManager.addView(popupView, popupParams);
-        handler.postDelayed(this::dismissPopup, 6000);
+        mainHandler.postDelayed(this::dismissPopup, 6000);
     }
 
-    private void addPopupRow(LinearLayout parent, int pad, String text, int color,
-                             View.OnClickListener click) {
+    private void addPopupBtn(LinearLayout parent, int pad, String text, int color,
+                              View.OnClickListener click) {
         TextView tv = new TextView(this);
-        tv.setText(text);
-        tv.setTextColor(color);
-        tv.setTextSize(15);
-        tv.setTypeface(Typeface.DEFAULT_BOLD);
-        tv.setGravity(Gravity.CENTER_HORIZONTAL);
-        tv.setPadding(pad * 2, pad, pad * 2, pad);
-        tv.setOnClickListener(click);
+        tv.setText(text); tv.setTextColor(color); tv.setTextSize(15);
+        tv.setTypeface(Typeface.DEFAULT_BOLD); tv.setGravity(Gravity.CENTER_HORIZONTAL);
+        tv.setPadding(pad*2, pad, pad*2, pad); tv.setOnClickListener(click);
         parent.addView(tv);
     }
 
     private void dismissPopup() {
         if (!popupShowing) return;
         popupShowing = false;
-        handler.removeCallbacksAndMessages(null);
+        mainHandler.removeCallbacksAndMessages(null);
         try { if (popupView != null) windowManager.removeView(popupView); } catch (Exception ignored) {}
         popupView = null;
     }
 
-    public void toggleAimOverlay() {
-        overlayVisible = !overlayVisible;
-        if (aimOverlayView != null) {
-            aimOverlayView.setVisibility(overlayVisible ? View.VISIBLE : View.GONE);
-            if (overlayVisible) injectDemoState();
-        }
-        ImageView icon = floatingBtnView != null
-                ? floatingBtnView.findViewById(R.id.floating_icon) : null;
-        if (icon != null) icon.setAlpha(overlayVisible ? 1.0f : 0.5f);
-    }
-
-    private void toggleAutoPlayFromPopup() {
-        if (!AutoShootService.isReady()) {
-            Log.w(TAG, "AutoPlay toggle from popup: accessibility not ready");
-            return;
-        }
-        setAutoPlay(!autoPlayEnabled);
-    }
-
-    // ── Aim overlay ────────────────────────────────────────────────────────────
+    // ── Aim overlay setup ─────────────────────────────────────────────────────
 
     private void setupAimOverlay() {
         aimOverlayView = new AimOverlayView(this);
 
-        // Wire swipe listener: translates overlay coordinates → gesture
-        aimOverlayView.setAutoplaySwipeListener((fromX, fromY, toX, toY, durationMs) -> {
-            AutoShootService svc = AutoShootService.INSTANCE;
-            if (svc == null) return;
-            float distVal = (float) Math.sqrt(
-                    (toX - fromX) * (toX - fromX) + (toY - fromY) * (toY - fromY));
-            float power = Math.min(1.0f, distVal / 240f);
-            svc.shoot(fromX, fromY, toX, toY, Math.max(0.45f, power));
-        });
+        // Swipe listener: uses powerFrac from CarromAI adaptive calibration
+        aimOverlayView.setAutoplaySwipeListener(
+            (fromX, fromY, toX, toY, durationMs, powerFrac) -> {
+                AutoShootService svc = AutoShootService.INSTANCE;
+                if (svc == null) return;
+                svc.shoot(fromX, fromY, toX, toY,
+                          Math.min(1.0f, Math.max(0.35f, powerFrac)));
+            });
 
         overlayParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -330,137 +317,170 @@ public class FloatingOverlayService extends Service {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
-
         aimOverlayView.setVisibility(View.VISIBLE);
         windowManager.addView(aimOverlayView, overlayParams);
     }
 
-    // ── External API (called from OverlayModule / ScreenCaptureService) ────────
+    // ── External API ──────────────────────────────────────────────────────────
 
     public void setShotMode(String mode) {
         if (aimOverlayView != null) aimOverlayView.setShotMode(mode);
     }
-
-    public void setMarginOffset(float dx, float dy) { /* removed — calibration feature dropped */ }
-
-    public void setSensitivity(float value) { /* reserved for future use */ }
+    public void setMarginOffset(float dx, float dy) { /* calibration removed */ }
+    public void setSensitivity(float value)         { /* reserved */           }
 
     public void setAutoPlayDelay(int ms) {
         autoPlayDelayMs = Math.max(500, ms);
-        // Note: we do NOT forward to aimOverlayView since it no longer
-        // has a timer-based runnable. The delay is used in handleAutoPlay()
-        // via the lastShootTimeMs cooldown guard instead.
     }
 
     /**
-     * Called from ScreenCaptureService on every detected frame (real live data).
-     * This is the ONLY path that sets hasLiveData and enables autoplay.
+     * Called from ScreenCaptureService on every frame (real live data).
+     * Updates overlay and triggers stability-based autoplay.
      */
     public void onDetectedState(GameState s) {
         if (s == null) return;
         if (aimOverlayView != null) {
-            // KEY: use setDetectedState (not setDemoState) — marks hasLiveData = true
             aimOverlayView.setDetectedState(s);
             if (!overlayVisible) {
                 overlayVisible = true;
                 aimOverlayView.setVisibility(View.VISIBLE);
             }
         }
-        // Stability-based autoplay — only fires here with real CV data
-        if (autoPlayEnabled && s.striker != null) {
-            handleAutoPlay(s);
-        }
+        if (autoPlayEnabled && s.striker != null) handleAutoPlay(s);
     }
 
-    /**
-     * Single manual shot trigger — called from OverlayModule.shootNow().
-     * Requires real live data and accessibility.
-     */
     public void shootNow() {
         AutoShootService acc = AutoShootService.INSTANCE;
-        if (acc == null) {
-            Log.w(TAG, "shootNow: AutoShootService not connected");
-            return;
-        }
-        // getLastBestShot() returns null if hasLiveData is false
-        AimOverlayView.BestShot best = (aimOverlayView != null)
-                ? aimOverlayView.getLastBestShot() : null;
-        if (best == null) {
-            Log.w(TAG, "shootNow: no best shot available (live data not ready)");
-            return;
-        }
-        Log.i(TAG, "shootNow: dispatching gesture");
-        acc.shoot(best.strikerX, best.strikerY, best.targetX, best.targetY, 0.78f);
+        if (acc == null) { Log.w(TAG, "shootNow: accessibility not connected"); return; }
+        AimOverlayView.BestShot best =
+            (aimOverlayView != null) ? aimOverlayView.getLastBestShot() : null;
+        if (best == null) { Log.w(TAG, "shootNow: no live shot cached"); return; }
+        Log.i(TAG, "shootNow: dispatching");
+        acc.shoot(best.strikerX, best.strikerY, best.targetX, best.targetY, best.powerFrac);
     }
 
-    /**
-     * Enable or disable autoplay. Does NOT start any timer — autoplay fires
-     * only via handleAutoPlay() which requires real CV data + stability.
-     */
     public void setAutoPlay(boolean enabled) {
         autoPlayEnabled = enabled;
         stableFrames    = 0;
         lastStrikerX    = Float.NaN;
         lastStrikerY    = Float.NaN;
-        // Note: NOT calling aimOverlayView.setAutoplay() — timer removed in v7
+        precomputedShot = null;
+        if (!enabled && physicsFuture != null) physicsFuture.cancel(true);
         Log.i(TAG, "AutoPlay " + (enabled ? "ON" : "OFF"));
     }
 
     public boolean isAutoPlayEnabled() { return autoPlayEnabled; }
 
-    // ── AutoPlay — stability-based trigger (real CV data ONLY) ─────────────────
+    public void toggleAimOverlay() {
+        overlayVisible = !overlayVisible;
+        if (aimOverlayView != null) {
+            aimOverlayView.setVisibility(overlayVisible ? View.VISIBLE : View.GONE);
+            if (overlayVisible) injectDemoState();
+        }
+    }
+
+    // ── Stability-based autoplay ──────────────────────────────────────────────
 
     /**
-     * Called from onDetectedState() with every live CV frame.
-     * Fires a gesture only when:
-     *  1. AutoShootService is connected (accessibility granted)
-     *  2. A shoot cooldown has passed
-     *  3. The striker has been stationary for STABLE_FRAMES_NEEDED frames
-     *     (meaning the carrom game is waiting for a shot, not mid-animation)
-     *  4. A best shot is available from the AI
+     * Called on every live CV frame.
+     *
+     * Flow:
+     *   frame 1–2  : unstable → reset
+     *   frame 3    : start background physics computation (prefetch)
+     *   frame 3–9  : waiting for stability + physics result
+     *   frame 10   : fire shot using physics result (or geometry fallback)
      */
     private void handleAutoPlay(GameState s) {
-        if (!AutoShootService.isReady()) {
-            // Accessibility not granted — silently wait
-            return;
-        }
+        if (!AutoShootService.isReady()) return;
 
         long now = System.currentTimeMillis();
-        // Enforce minimum delay between shots (respects user-set delay too)
         long minGap = Math.max(SHOOT_COOLDOWN_MS, autoPlayDelayMs);
         if (now - lastShootTimeMs < minGap) return;
 
-        float sx = s.striker.pos.x;
-        float sy = s.striker.pos.y;
+        float sx = s.striker.pos.x, sy = s.striker.pos.y;
 
-        // Count consecutive stable frames (striker not moving)
+        // Track stability
         if (!Float.isNaN(lastStrikerX)) {
             float moved = (float) Math.sqrt(
-                    (sx - lastStrikerX) * (sx - lastStrikerX)
-                  + (sy - lastStrikerY) * (sy - lastStrikerY));
-            stableFrames = (moved > STABLE_THRESH_PX) ? 0 : stableFrames + 1;
+                (sx-lastStrikerX)*(sx-lastStrikerX) + (sy-lastStrikerY)*(sy-lastStrikerY));
+            if (moved > STABLE_THRESH_PX) {
+                stableFrames    = 0;
+                precomputedShot = null;
+                if (physicsFuture != null) physicsFuture.cancel(true);
+                computing.set(false);
+            } else {
+                stableFrames++;
+            }
         }
-        lastStrikerX = sx;
-        lastStrikerY = sy;
+        lastStrikerX = sx; lastStrikerY = sy;
+
+        // Prefetch physics shot at frame PREFETCH_FRAMES
+        if (stableFrames == PREFETCH_FRAMES && computing.compareAndSet(false, true)) {
+            final GameState snapshot = s;
+            physicsFuture = physicsThread.submit(() -> {
+                try {
+                    CarromAI.AiShot shot = CarromAI.findBestShotPhysics(snapshot);
+                    precomputedShot  = shot;
+                    precomputedState = snapshot;
+                    // Push physics result to overlay view for display
+                    if (aimOverlayView != null && shot != null) {
+                        mainHandler.post(() ->
+                            aimOverlayView.setPhysicsBestShot(shot, snapshot));
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Physics computation failed: " + e.getMessage());
+                } finally {
+                    computing.set(false);
+                }
+            });
+        }
 
         if (stableFrames < STABLE_FRAMES_NEEDED) return;
 
-        // Board is stable — fire the best shot
-        // getLastBestShot() returns null if hasLiveData is false (safety guard)
-        AimOverlayView.BestShot best = (aimOverlayView != null)
-                ? aimOverlayView.getLastBestShot() : null;
-        if (best == null) return;
+        // Board stable — fire!
+        CarromAI.AiShot physShot = precomputedShot;
 
-        Log.i(TAG, "AutoPlay: stable for " + stableFrames + " frames — firing gesture");
-        AutoShootService.INSTANCE.shoot(
+        if (physShot != null) {
+            // Use physics-validated shot with adaptive power
+            float dx = physShot.ghostPos.x - s.striker.pos.x;
+            float dy = physShot.ghostPos.y - s.striker.pos.y;
+            float factor = 1.20f;
+            float toX = s.striker.pos.x + dx * factor;
+            float toY = s.striker.pos.y + dy * factor;
+            float pwr = Math.min(1.0f, Math.max(0.35f, physShot.powerFrac));
+            Log.i(TAG, String.format(
+                "AutoPlay PHYSICS: stable=%d pwr=%.2f target=(%.0f,%.0f)",
+                stableFrames, pwr, toX, toY));
+            AutoShootService.INSTANCE.shoot(s.striker.pos.x, s.striker.pos.y,
+                                            toX, toY, pwr);
+        } else {
+            // Fallback to geometry-based cached shot
+            AimOverlayView.BestShot best =
+                (aimOverlayView != null) ? aimOverlayView.getLastBestShot() : null;
+            if (best == null) return;
+            Log.i(TAG, String.format(
+                "AutoPlay GEO FALLBACK: stable=%d pwr=%.2f",
+                stableFrames, best.powerFrac));
+            AutoShootService.INSTANCE.shoot(
                 best.strikerX, best.strikerY,
-                best.targetX,  best.targetY, 0.75f);
+                best.targetX,  best.targetY, best.powerFrac);
+        }
 
         lastShootTimeMs = now;
-        stableFrames    = 0; // reset so next shot requires fresh stability
+        stableFrames    = 0;
+        precomputedShot = null;
+        precomputedState = null;
     }
 
-    // ── Notification ───────────────────────────────────────────────────────────
+    private void toggleAutoPlayFromPopup() {
+        if (!AutoShootService.isReady()) {
+            Log.w(TAG, "Accessibility not ready — cannot toggle AutoPlay");
+            return;
+        }
+        setAutoPlay(!autoPlayEnabled);
+    }
+
+    // ── Notification ──────────────────────────────────────────────────────────
 
     private int overlayType() {
         return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
@@ -471,8 +491,8 @@ public class FloatingOverlayService extends Service {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "AIMxASSIST v7 Running", NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription("Aim assist overlay is active");
+                    CHANNEL_ID, "AIMxASSIST v8 Running", NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription("Aim assist overlay active — physics AI ready");
             NotificationManager nm = getSystemService(NotificationManager.class);
             if (nm != null) nm.createNotificationChannel(ch);
         }
@@ -487,8 +507,8 @@ public class FloatingOverlayService extends Service {
         Intent openIntent    = new Intent(this, MainActivity.class);
         PendingIntent openPi = PendingIntent.getActivity(this, 1, openIntent, piFlags);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("AIMxASSIST v7 Active")
-                .setContentText("Aim lines ON — tap floating icon to control")
+                .setContentTitle("AIMxASSIST v8 — Physics AI Active")
+                .setContentText("Ghost-ball + sub-pixel physics autoplay ready")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentIntent(openPi)
                 .addAction(0, "Stop", stopPi)
@@ -507,6 +527,7 @@ public class FloatingOverlayService extends Service {
     public void onDestroy() {
         super.onDestroy();
         INSTANCE = null;
+        physicsThread.shutdownNow();
         dismissPopup();
         try { if (floatingBtnView != null) windowManager.removeView(floatingBtnView); } catch (Exception ignored) {}
         try { if (aimOverlayView  != null) windowManager.removeView(aimOverlayView);  } catch (Exception ignored) {}
