@@ -14,8 +14,8 @@ android {
         applicationId "com.bitaim.carromaim"
         minSdkVersion 23          // Android 6.0+
         targetSdkVersion 34       // Android 14
-        versionCode 6
-        versionName "6.0"
+        versionCode 7
+        versionName "7.0"
         multiDexEnabled true
 
         // Pure-Java detector — no native .so files needed.
