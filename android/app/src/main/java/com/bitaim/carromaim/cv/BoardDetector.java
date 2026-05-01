@@ -119,8 +119,8 @@ package com.bitaim.carromaim.cv;
                   int colorClass = classifyColor(roiHsv, (int)c[0], (int)c[1], (int)c[2]);
                   if (colorClass < 0) continue;
                   all.add(new Coin(
-                      (c[0] + roiOffX) / scale, (c[1] + roiOffY) / scale,
-                      c[2] / scale, colorClass, false));
+                    (float)((c[0] + roiOffX) / scale), (float)((c[1] + roiOffY) / scale),
+                    (float)(c[2] / scale), colorClass, false));
               }
           }
           if (roiRect != null) { roiGray.release(); roiHsv.release(); }
