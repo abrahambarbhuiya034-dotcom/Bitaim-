@@ -10,31 +10,41 @@ import java.util.Iterator;
 import java.util.List;
 
 /**
- * BoardDetector v6 — Pure Java, zero OpenCV.
+ * BoardDetector v7 — Pure Java, hardcoded proportions from real Carrom Disc Pool screenshot.
  *
- * Works on every Android phone using only Bitmap.getPixels().
+ * Root cause of v6 failure: orange-pixel board detection was unreliable because the
+ * wooden board floor has warm pixels that pass the orange test, corrupting board bounds.
+ * Coin detection then scanned the wrong region → zero coins found → zero aim lines.
  *
- * Pipeline per frame (~33 ms):
- *  1. Downscale bitmap to ≤360 px wide.
- *  2. Scan every 4 px for orange/brown border pixels → board bounding box.
- *  3. Inside board, scan every 3 px, classify each pixel:
- *       white → coin or striker
- *       black → black coin
- *       red   → queen
- *  4. Greedy-cluster same-colour hits into blobs → Coin objects.
- *  5. Striker = largest white blob in bottom 38 % of board height.
- *  6. EMA-smooth the board rectangle across frames.
- *  7. Return GameState with coordinates in input-bitmap space.
+ * v7 fixes:
+ *   1. Board bounds HARDCODED as proportions of screen size (matches Carrom Disc Pool).
+ *   2. Striker X detected by scanning slider bar at bottom of screen for blue indicator.
+ *   3. Coin pixel classifier tightened — wood floor pixels no longer classified as coins.
+ *   4. Fallback state includes seed coins so aim lines appear even before real detection.
  */
 public class BoardDetector {
 
-    private static final String TAG       = "BoardDetector";
-    private static final int    PROC_W    = 360;
-    private static final float  EMA_A     = 0.18f;
-    private static final int    SCAN_STEP = 3;
+    private static final String TAG = "BoardDetector";
 
-    private RectF smoothedBoard = null;
-    private int[] pixelBuf      = null;
+    // Board proportions (Carrom Disc Pool, measured from real game screenshot)
+    private static final float BOARD_LEFT_FRAC  = 0.056f;
+    private static final float BOARD_RIGHT_FRAC = 0.944f;
+    private static final float BOARD_TOP_FRAC   = 0.205f;
+    private static final float PLAY_INSET_FRAC  = 0.062f;   // fraction of board side
+    private static final float POCKET_DIST_FRAC = 0.048f;
+
+    // Slider bar at the very bottom of the game screen
+    private static final float SLIDER_Y_FRAC     = 0.905f;
+    private static final float SLIDER_X_MIN_FRAC = 0.213f;
+    private static final float SLIDER_X_MAX_FRAC = 0.787f;
+
+    // Striker baseline Y inside the board (fraction of board height from top)
+    private static final float STRIKER_Y_BOARD_FRAC = 0.920f;
+
+    private static final int   SCAN_STEP = 3;
+    private static final int   PROC_W    = 400;
+
+    private int[] pixelBuf = null;
 
     public void setMinRadiusFrac(float v) {}
     public void setMaxRadiusFrac(float v) {}
@@ -50,8 +60,6 @@ public class BoardDetector {
         }
     }
 
-    // ── Main pipeline ─────────────────────────────────────────────────────────
-
     private GameState run(Bitmap src) {
         int srcW = src.getWidth(), srcH = src.getHeight();
         if (srcW == 0 || srcH == 0) return null;
@@ -61,97 +69,89 @@ public class BoardDetector {
         int   pH    = Math.round(srcH * scale);
 
         Bitmap bmp = (scale < 0.99f)
-            ? Bitmap.createScaledBitmap(src, pW, pH, false) : src;
-
+                ? Bitmap.createScaledBitmap(src, pW, pH, false) : src;
         int total = pW * pH;
         if (pixelBuf == null || pixelBuf.length < total) pixelBuf = new int[total];
         bmp.getPixels(pixelBuf, 0, pW, 0, 0, pW, pH);
         if (bmp != src) bmp.recycle();
 
-        RectF rawBoard = detectBoard(pixelBuf, pW, pH);
-        if (rawBoard == null) rawBoard = fallbackBoardPx(pW, pH);
-        smoothedBoard = smoothRect(smoothedBoard, rawBoard);
-        RectF pb = smoothedBoard;
+        // 1. Hardcoded board rect (square, centered horizontally)
+        float boardSide = pW * (BOARD_RIGHT_FRAC - BOARD_LEFT_FRAC);
+        RectF pb = new RectF(
+                pW * BOARD_LEFT_FRAC,
+                pH * BOARD_TOP_FRAC,
+                pW * BOARD_RIGHT_FRAC,
+                pH * BOARD_TOP_FRAC + boardSide);
 
-        float minR = pb.width() * 0.022f;
-        float maxR = pb.width() * 0.070f;
-        List<Coin> coins = detectCoins(pixelBuf, pW, pH, pb, minR, maxR);
+        // Play area (inside orange frame)
+        float inset = boardSide * PLAY_INSET_FRAC;
+        RectF play = new RectF(
+                pb.left + inset, pb.top + inset,
+                pb.right - inset, pb.bottom - inset);
 
+        // 2. Coin detection inside play area
+        float minR = boardSide * 0.022f;
+        float maxR = boardSide * 0.070f;
+        List<Coin> coins = detectCoins(pixelBuf, pW, pH, play, minR, maxR);
+
+        // 3. Striker X from slider bar
+        float sliderY    = pH * SLIDER_Y_FRAC;
+        float sliderXMin = pW * SLIDER_X_MIN_FRAC;
+        float sliderXMax = pW * SLIDER_X_MAX_FRAC;
+        float indX = findSliderIndicator(pixelBuf, pW, pH,
+                (int) sliderXMin, (int) sliderXMax, (int) sliderY);
+
+        float strikerX;
+        if (indX >= 0) {
+            float t = (indX - sliderXMin) / Math.max(1f, sliderXMax - sliderXMin);
+            strikerX = play.left + t * play.width();
+        } else {
+            strikerX = pb.centerX();
+        }
+        float strikerY = pb.top + boardSide * STRIKER_Y_BOARD_FRAC;
+        float strikerR = boardSide * 0.027f;
+
+        // 4. Scale back to source resolution
         float inv = 1f / scale;
         RectF srcBoard = scaleRect(pb, inv);
 
-        List<Coin> scaled = new ArrayList<>(coins.size());
-        for (Coin c : coins)
-            scaled.add(new Coin(c.pos.x * inv, c.pos.y * inv,
-                                c.radius * inv, c.color, false));
-
-        float strikerThreshY = pb.top + pb.height() * 0.62f;
-        Coin striker = null;
-        for (Coin c : scaled) {
-            if (c.color != Coin.COLOR_WHITE) continue;
-            if (c.pos.y < strikerThreshY * inv) continue;
-            if (striker == null || c.radius > striker.radius) striker = c;
-        }
-
         GameState s = new GameState();
-        s.board = srcBoard;
-
-        if (striker != null) {
-            striker.isStriker = true;
-            striker.color     = Coin.COLOR_STRIKER;
-            s.striker         = striker;
-        } else {
-            s.striker = new Coin(srcBoard.centerX(),
-                srcBoard.top + srcBoard.height() * 0.84f,
-                srcBoard.width() * 0.026f, Coin.COLOR_STRIKER, true);
-        }
-
-        for (Coin c : scaled) if (c != striker) s.coins.add(c);
+        s.board   = srcBoard;
+        s.striker = new Coin(strikerX * inv, strikerY * inv, strikerR * inv,
+                Coin.COLOR_STRIKER, true);
+        for (Coin c : coins)
+            s.coins.add(new Coin(c.pos.x * inv, c.pos.y * inv, c.radius * inv, c.color, false));
         addPockets(s);
         return s;
     }
 
-    // ── Board detection ───────────────────────────────────────────────────────
-
-    private RectF detectBoard(int[] px, int w, int h) {
-        int minX = w, maxX = 0, minY = h, maxY = 0, cnt = 0;
-        for (int y = 0; y < h; y += 4) {
-            for (int x = 0; x < w; x += 4) {
-                if (isOrange(px[y * w + x])) {
-                    if (x < minX) minX = x;
-                    if (x > maxX) maxX = x;
-                    if (y < minY) minY = y;
-                    if (y > maxY) maxY = y;
-                    cnt++;
-                }
+    // Scan slider bar for the brightest blue or white indicator pixel
+    private float findSliderIndicator(int[] px, int w, int h,
+                                      int xMin, int xMax, int sliderY) {
+        int yMin = Math.max(0, sliderY - 18);
+        int yMax = Math.min(h - 1, sliderY + 18);
+        float bestX = -1;
+        int   bestScore = 55;
+        for (int y = yMin; y <= yMax; y += 2) {
+            for (int x = xMin; x <= xMax; x += 4) {
+                int p = px[y * w + x];
+                int r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
+                int score = 0;
+                if (b > 120 && b > r + 35 && b > g + 20)          score = b - r + b - g;
+                else if (r > 185 && g > 185 && b > 185)            score = (r+g+b)/3 - 110;
+                if (score > bestScore) { bestScore = score; bestX = x; }
             }
         }
-        float minSpan = w * 0.25f;
-        if (cnt < 15 || (maxX - minX) < minSpan || (maxY - minY) < minSpan) return null;
-
-        float side = Math.max(maxX - minX, maxY - minY);
-        float cx = (minX + maxX) / 2f, cy = (minY + maxY) / 2f;
-        return new RectF(Math.max(0, cx - side/2f), Math.max(0, cy - side/2f),
-                         Math.min(w, cx + side/2f), Math.min(h, cy + side/2f));
+        return bestX;
     }
-
-    /** Carrom board orange/brown border: warm hue, R>G>B, high contrast. */
-    private boolean isOrange(int p) {
-        int r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
-        return r > 140 && g > 50 && g < 170 && b < 100
-            && r > g && g > b && (r - b) > 80;
-    }
-
-    // ── Coin / pixel detection ────────────────────────────────────────────────
 
     private List<Coin> detectCoins(int[] px, int w, int h,
-                                   RectF board, float minR, float maxR) {
-        int bL = Math.max(0, (int)(board.left   + board.width()  * 0.04f));
-        int bR = Math.min(w, (int)(board.right  - board.width()  * 0.04f));
-        int bT = Math.max(0, (int)(board.top    + board.height() * 0.04f));
-        int bB = Math.min(h, (int)(board.bottom - board.height() * 0.04f));
+                                   RectF play, float minR, float maxR) {
+        int bL = Math.max(0, (int) play.left),  bR = Math.min(w, (int) play.right);
+        int bT = Math.max(0, (int) play.top),   bB = Math.min(h, (int) play.bottom);
 
-        List<float[]> whites = new ArrayList<>(), blacks = new ArrayList<>(),
+        List<float[]> whites = new ArrayList<>(),
+                      blacks = new ArrayList<>(),
                       reds   = new ArrayList<>();
 
         for (int y = bT; y < bB; y += SCAN_STEP) {
@@ -159,41 +159,40 @@ public class BoardDetector {
                 switch (classifyPx(px[y * w + x])) {
                     case Coin.COLOR_WHITE: whites.add(new float[]{x, y}); break;
                     case Coin.COLOR_BLACK: blacks.add(new float[]{x, y}); break;
-                    case Coin.COLOR_RED:   reds  .add(new float[]{x, y}); break;
+                    case Coin.COLOR_RED:   reds.add(new float[]{x, y});   break;
                     default: break;
                 }
             }
         }
 
         List<Coin> out = new ArrayList<>();
-        cluster(whites, Coin.COLOR_WHITE, maxR * 1.4f, minR, maxR, out);
-        cluster(blacks, Coin.COLOR_BLACK, maxR * 1.4f, minR, maxR, out);
-        cluster(reds,   Coin.COLOR_RED,   maxR * 1.2f, minR * 0.4f, maxR * 0.85f, out);
+        cluster(whites, Coin.COLOR_WHITE, maxR * 1.5f, minR, maxR, out);
+        cluster(blacks, Coin.COLOR_BLACK, maxR * 1.5f, minR, maxR, out);
+        cluster(reds,   Coin.COLOR_RED,   maxR * 1.2f, minR * 0.35f, maxR * 0.80f, out);
         nms(out);
         return out;
     }
 
+    /**
+     * Pixel classifier — tight thresholds to avoid wood-floor false positives.
+     * Wood floor: R≈180 G≈140 B≈90, lum≈137 — must NOT match any category.
+     */
     private int classifyPx(int p) {
         int r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
         int lum = (r + g + b) / 3;
-
-        // White coin: high lum, balanced RGB
-        if (lum > 170 && r > 150 && g > 150 && b > 150
-                && Math.max(r, Math.max(g, b)) - Math.min(r, Math.min(g, b)) < 55)
+        // White coin
+        if (lum > 185 && r > 165 && g > 165 && b > 155
+                && Math.max(r, Math.max(g, b)) - Math.min(r, Math.min(g, b)) < 50)
             return Coin.COLOR_WHITE;
-
-        // Black coin: very dark
-        if (lum < 55 && r < 70 && g < 70 && b < 70)
+        // Black coin (very dark)
+        if (lum < 45 && r < 60 && g < 60 && b < 60)
             return Coin.COLOR_BLACK;
-
-        // Red queen: dominant red channel
-        if (r > 140 && g < 70 && b < 80 && r > g * 2 && r > b * 2)
+        // Red / pink queen
+        if (r > 150 && g < 80 && b < 100 && r > g * 2 && r > b * 1.5f)
             return Coin.COLOR_RED;
-
         return -1;
     }
 
-    /** Greedy single-pass clustering. Each cluster = [cx, cy, count]. */
     private void cluster(List<float[]> pts, int color, float mergeR,
                          float minR, float maxR, List<Coin> out) {
         if (pts.isEmpty()) return;
@@ -203,25 +202,26 @@ public class BoardDetector {
             for (int i = 0; i < cl.size(); i++) {
                 float[] c = cl.get(i);
                 float dx = pt[0]-c[0], dy = pt[1]-c[1];
-                float d = (float) Math.sqrt(dx*dx + dy*dy);
+                float d = (float) Math.sqrt(dx*dx+dy*dy);
                 if (d < best) { best = d; bi = i; }
             }
             if (bi >= 0) {
                 float[] c = cl.get(bi); float n = c[2];
-                c[0] = (c[0]*n + pt[0])/(n+1); c[1] = (c[1]*n + pt[1])/(n+1); c[2] = n+1;
+                c[0] = (c[0]*n+pt[0])/(n+1); c[1] = (c[1]*n+pt[1])/(n+1); c[2] = n+1;
             } else {
                 cl.add(new float[]{pt[0], pt[1], 1});
             }
         }
-        int minHits = Math.max(2, (int)(Math.PI*minR*minR/(SCAN_STEP*SCAN_STEP)*0.20f));
+        int minHits = Math.max(2,
+                (int)(Math.PI * minR * minR / (SCAN_STEP * SCAN_STEP) * 0.18f));
         for (float[] c : cl) {
             if (c[2] < minHits) continue;
             float estR = (float) Math.sqrt(c[2] * SCAN_STEP * SCAN_STEP / Math.PI);
-            out.add(new Coin(c[0], c[1], Math.max(minR, Math.min(maxR, estR)), color, false));
+            out.add(new Coin(c[0], c[1],
+                    Math.max(minR, Math.min(maxR, estR)), color, false));
         }
     }
 
-    /** Non-maximum suppression — keeps larger of two overlapping circles. */
     private void nms(List<Coin> coins) {
         boolean[] keep = new boolean[coins.size()];
         java.util.Arrays.fill(keep, true);
@@ -232,8 +232,7 @@ public class BoardDetector {
                 if (!keep[j]) continue;
                 Coin b = coins.get(j);
                 float dx = a.pos.x-b.pos.x, dy = a.pos.y-b.pos.y;
-                float d  = (float) Math.sqrt(dx*dx+dy*dy);
-                if (d < (a.radius+b.radius)*0.60f) {
+                if ((float)Math.sqrt(dx*dx+dy*dy) < (a.radius+b.radius)*0.60f) {
                     if (a.radius >= b.radius) keep[j] = false;
                     else { keep[i] = false; break; }
                 }
@@ -243,46 +242,36 @@ public class BoardDetector {
         while (it.hasNext()) { it.next(); if (!keep[idx++]) it.remove(); }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private RectF fallbackBoardPx(int w, int h) {
-        float side = w * 0.72f, cx = w/2f, cy = h*0.48f;
-        return new RectF(cx-side/2f, cy-side/2f, cx+side/2f, cy+side/2f);
+    private void addPockets(GameState s) {
+        if (s.board == null) return;
+        float side = s.board.width();
+        float pd   = side * POCKET_DIST_FRAC;
+        s.pockets.add(new PointF(s.board.left  + pd, s.board.top    + pd));
+        s.pockets.add(new PointF(s.board.right - pd, s.board.top    + pd));
+        s.pockets.add(new PointF(s.board.left  + pd, s.board.bottom - pd));
+        s.pockets.add(new PointF(s.board.right - pd, s.board.bottom - pd));
     }
 
     private GameState fallbackState(int w, int h) {
         GameState s = new GameState();
-        float side = w*0.72f, cx = w/2f, cy = h*0.48f;
-        s.board   = new RectF(cx-side/2f, cy-side/2f, cx+side/2f, cy+side/2f);
-        s.striker = new Coin(cx, cy+side*0.34f, side*0.025f, Coin.COLOR_STRIKER, true);
-        float r = side*0.022f;
-        s.coins.add(new Coin(cx,              cy-side*0.10f, r, Coin.COLOR_WHITE, false));
-        s.coins.add(new Coin(cx-side*0.12f,   cy,            r, Coin.COLOR_BLACK, false));
-        s.coins.add(new Coin(cx+side*0.12f,   cy,            r, Coin.COLOR_BLACK, false));
-        s.coins.add(new Coin(cx,              cy,            r, Coin.COLOR_RED,   false));
+        float side = w * (BOARD_RIGHT_FRAC - BOARD_LEFT_FRAC);
+        float bl   = w * BOARD_LEFT_FRAC,  bt = h * BOARD_TOP_FRAC;
+        s.board   = new RectF(bl, bt, bl+side, bt+side);
+        float r   = side * 0.026f;
+        s.striker = new Coin(s.board.centerX(),
+                bt + side * STRIKER_Y_BOARD_FRAC, r, Coin.COLOR_STRIKER, true);
+        float cr = side * 0.024f;
+        float cx = s.board.centerX(), cy = s.board.centerY();
+        // Seed coins so aim lines appear before real detection starts
+        s.coins.add(new Coin(cx,              cy - side*0.08f, cr,       Coin.COLOR_WHITE, false));
+        s.coins.add(new Coin(cx - side*0.10f, cy,              cr,       Coin.COLOR_BLACK, false));
+        s.coins.add(new Coin(cx + side*0.10f, cy,              cr,       Coin.COLOR_BLACK, false));
+        s.coins.add(new Coin(cx,              cy,              cr*0.70f, Coin.COLOR_RED,   false));
         addPockets(s);
         return s;
     }
 
-    private void addPockets(GameState s) {
-        if (s.board == null) return;
-        float i = s.board.width() * 0.030f;
-        s.pockets.add(new PointF(s.board.left  + i, s.board.top    + i));
-        s.pockets.add(new PointF(s.board.right - i, s.board.top    + i));
-        s.pockets.add(new PointF(s.board.left  + i, s.board.bottom - i));
-        s.pockets.add(new PointF(s.board.right - i, s.board.bottom - i));
-    }
-
     private RectF scaleRect(RectF r, float s) {
         return new RectF(r.left*s, r.top*s, r.right*s, r.bottom*s);
-    }
-
-    private RectF smoothRect(RectF p, RectF n) {
-        if (p == null) return n; if (n == null) return p;
-        return new RectF(
-            p.left   + EMA_A*(n.left   - p.left),
-            p.top    + EMA_A*(n.top    - p.top),
-            p.right  + EMA_A*(n.right  - p.right),
-            p.bottom + EMA_A*(n.bottom - p.bottom));
     }
 }
