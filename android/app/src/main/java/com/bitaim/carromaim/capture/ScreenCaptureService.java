@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
@@ -75,7 +76,12 @@ public class ScreenCaptureService extends Service {
         super.onCreate();
         INSTANCE = this;
         createChannel();
-        startForeground(NOTIF_ID, buildNotification());
+        Notification notif = buildNotification();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } else {
+            startForeground(NOTIF_ID, notif);
+        }
 
         WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         DisplayMetrics dm = new DisplayMetrics();

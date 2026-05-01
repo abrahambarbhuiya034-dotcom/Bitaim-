@@ -9,7 +9,8 @@ public class MainActivity extends ReactActivity {
 
     @Override
     protected String getMainComponentName() {
-        return "BitAim";
+        // Must match the "name" field in app.json exactly
+        return "AIMxASSIST";
     }
 
     @Override
