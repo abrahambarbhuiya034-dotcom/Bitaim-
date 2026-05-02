@@ -1,12 +1,14 @@
 /**
- * AIMxASSIST — v7.0
+ * AIMxASSIST — v8.3
  * Main React Native UI
  *
- * v7 changes:
- *  - Removed Margin Calibration feature entirely
- *  - AutoPlay toggle no longer crashes/exits the app (stability-based, live-CV-only)
- *  - Upgraded autoplay engine integrated
- *  - Lines fixed (proper ghost-ball geometry)
+ * v8.3 changes:
+ *  - Version strings updated throughout (subtitle, footer, popup, notification)
+ *
+ * v8.2 changes:
+ *  - Removed "Prediction Lines" mode-selector card (always uses ALL mode)
+ *  - Removed colour-coding legend
+ *  - Autoplay fixes carried from v8.1
  */
 
 import React, {useState, useEffect, useCallback} from 'react';
@@ -27,29 +29,10 @@ import Slider from '@react-native-community/slider';
 
 const {OverlayModule} = NativeModules;
 
-type ShotMode = 'ALL' | 'DIRECT' | 'AI' | 'GOLDEN' | 'LUCKY';
-
-const SHOT_MODES: {mode: ShotMode; label: string; desc: string}[] = [
-  {mode: 'ALL',    label: 'All Lines', desc: 'Show every prediction simultaneously'},
-  {mode: 'DIRECT', label: 'Direct',    desc: 'Striker straight line only'},
-  {mode: 'AI',     label: 'AI Aim',    desc: 'Striker + coin chain reactions'},
-  {mode: 'GOLDEN', label: 'Golden',    desc: 'Up to one cushion bounce'},
-  {mode: 'LUCKY',  label: 'Lucky',     desc: 'Up to two cushion bounces'},
-];
-
-const LINE_LEGEND = [
-  {color: '#FFD700', label: '#1 Best (Gold)'},
-  {color: '#00E5FF', label: '#2 (Cyan)'},
-  {color: '#FF8A00', label: '#3 (Orange)'},
-  {color: '#D946EF', label: '#4 (Purple)'},
-  {color: '#22C55E', label: '#5 (Green)'},
-];
-
 export default function App() {
   const [hasOverlay, setHasOverlay]           = useState(false);
   const [overlayActive, setOverlayActive]     = useState(false);
   const [autoDetect, setAutoDetect]           = useState(false);
-  const [selectedMode, setSelectedMode]       = useState<ShotMode>('ALL');
   const [sensitivity, setSensitivity]         = useState(1.0);
   const [detectThreshold, setDetectThreshold] = useState(36);
 
@@ -191,11 +174,6 @@ export default function App() {
     }
   }, [overlayActive, autoDetect, accessibilityReady]);
 
-  const handleModeSelect = useCallback((mode: ShotMode) => {
-    setSelectedMode(mode);
-    try { OverlayModule.setShotMode(mode); } catch {}
-  }, []);
-
   const handleSensitivityChange = useCallback((val: number) => {
     setSensitivity(val);
     try { OverlayModule.setSensitivity(val); } catch {}
@@ -217,7 +195,7 @@ export default function App() {
 
       <View style={styles.header}>
         <Text style={styles.logo}>AIMxASSIST</Text>
-        <Text style={styles.subtitle}>Auto-Detect Carrom Aim Assist • v7.0</Text>
+        <Text style={styles.subtitle}>Auto-Detect Carrom Aim Assist • v8.3</Text>
       </View>
 
       <ScrollView style={styles.scroll}
@@ -320,35 +298,6 @@ export default function App() {
           </TouchableOpacity>
         </View>
 
-        {/* Prediction Lines */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Prediction Lines</Text>
-          <Text style={styles.cardSub}>
-            Up to 5 lines — ranked by AI ghost-ball score. Gold = best shot.
-          </Text>
-          <View style={styles.shotGrid}>
-            {SHOT_MODES.map(({mode, label, desc}) => (
-              <TouchableOpacity key={mode}
-                style={[styles.shotBtn,
-                  selectedMode === mode && styles.shotBtnActive]}
-                onPress={() => handleModeSelect(mode)}>
-                <Text style={[styles.shotLabel,
-                  selectedMode === mode && styles.shotLabelActive]}>{label}</Text>
-                <Text style={styles.shotDesc}>{desc}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          <View style={styles.legend}>
-            {LINE_LEGEND.map(item => (
-              <LegendDot key={item.label} color={item.color} label={item.label} />
-            ))}
-            <LegendDot color="#FFFFFF" label="Striker path" />
-            <LegendDot color="#00E5FF" label="Wall bounce" />
-            <LegendDot color="#22C55E" label="Coin → pocket" />
-          </View>
-        </View>
-
         {/* Shot Power */}
         <View style={styles.card}>
           <View style={styles.rowSpread}>
@@ -403,19 +352,10 @@ export default function App() {
 
         <View style={styles.footer}>
           <Text style={styles.footerText}>
-            AIMxASSIST v7.0 • Ghost-Ball AI • Stable AutoPlay • Android 7+
+            AIMxASSIST v8.3 • Ghost-Ball AI • Stable AutoPlay • Android 7+
           </Text>
         </View>
       </ScrollView>
-    </View>
-  );
-}
-
-function LegendDot({color, label}: {color: string; label: string}) {
-  return (
-    <View style={styles.legendItem}>
-      <View style={[styles.legendSwatch, {backgroundColor: color}]} />
-      <Text style={styles.legendLabel}>{label}</Text>
     </View>
   );
 }
@@ -445,20 +385,7 @@ const styles = StyleSheet.create({
   cardSub:       {color: '#8888BB', fontSize: 12, marginBottom: 8},
   row:           {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between'},
   rowSpread:     {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center'},
-  shotGrid:      {flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 8},
-  shotBtn:       {
-    width: '47%', backgroundColor: '#1E1E3A', borderRadius: 10, padding: 12,
-    borderWidth: 1.5, borderColor: '#333355', alignItems: 'flex-start',
-  },
-  shotBtnActive:  {borderColor: '#FFD700', backgroundColor: '#26260A'},
-  shotLabel:      {color: '#AAA', fontSize: 14, fontWeight: '700'},
-  shotLabelActive:{color: '#FFD700'},
-  shotDesc:       {color: '#666688', fontSize: 10, marginTop: 3},
-  legend:         {flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 12},
-  legendItem:     {flexDirection: 'row', alignItems: 'center'},
-  legendSwatch:   {width: 12, height: 4, borderRadius: 2, marginRight: 6},
-  legendLabel:    {color: '#AAA', fontSize: 11},
-  slider:         {width: '100%', height: 36},
+  slider:        {width: '100%', height: 36},
   sliderEndLabel: {color: '#666688', fontSize: 11},
   valueLabel:     {color: '#FFD700', fontSize: 16, fontWeight: '700'},
   shootNowBtn:    {
