@@ -1,0 +1,64 @@
+apply plugin: "com.android.application"
+apply plugin: "kotlin-android"
+apply plugin: "com.facebook.react"
+
+react {
+    // React Native auto-linking
+}
+
+android {
+    namespace "com.bitaim.carromaim"
+    compileSdkVersion 34
+
+    defaultConfig {
+        applicationId "com.bitaim.carromaim"
+        minSdkVersion 23          // Android 6.0+
+        targetSdkVersion 34       // Android 14
+        versionCode 6
+        versionName "6.0"
+        multiDexEnabled true
+
+        // Pure-Java detector — no native .so files needed.
+        // Keeping only arm64-v8a makes the APK ~20 MB smaller.
+        ndk {
+            abiFilters "armeabi-v7a", "arm64-v8a"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"),
+                    "proguard-rules.pro"
+            signingConfig signingConfigs.debug  // replace with release keystore for production
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    kotlinOptions {
+        jvmTarget = "11"
+    }
+}
+
+dependencies {
+    implementation "com.facebook.react:react-android"
+    implementation "com.facebook.react:hermes-android"
+
+    implementation "androidx.appcompat:appcompat:1.6.1"
+    implementation "androidx.core:core-ktx:1.10.1"
+    implementation "com.google.android.material:material:1.9.0"
+    implementation "androidx.multidex:multidex:2.0.1"
+
+    // OpenCV removed — BoardDetector v6 uses pure Java Bitmap pixel APIs.
+    // APK is ~30 MB smaller as a result.
+}
+
+apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
+applyNativeModulesAppBuildGradle(project)

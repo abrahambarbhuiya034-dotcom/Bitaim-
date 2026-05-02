@@ -1,0 +1,80 @@
+AIMxASSIST v8.3 — OpenCV Board Detection Rebuild + Visual Aim Lines Overhaul
+==============================================================================
+
+BUGS FIXED IN v8.3
+──────────────────
+
+1. Board detection fails / detects wrong area  [BoardDetector.java — FULL REWRITE]
+
+   ROOT CAUSE A — Old bounding-box method (min/max of orange pixels) gave wrong
+   results in portrait orientation. The board's vertical orange span was always
+   LARGER than the horizontal span (phone UI bars above/below board shift perceived
+   height). Old code used max(width, height) as the board "side", making the
+   detected board ~20 % too large and offset incorrectly.
+
+   FIX: Replaced with row/column DENSITY SCAN. A row/column is counted as "orange
+   frame" only when it has ≥ w/30 orange-border pixels. From those ranges, the
+   board side = min(horizontal_span, vertical_span) since the board is always
+   square and the smaller dimension is the correct one.
+
+   ROOT CAUSE B — detectByPocketCorners() searched from the absolute image CORNERS
+   (0,0), (w,0), etc. with a fixed radius. In Carrom Disc Pool the pocket circles
+   are ~18-22 % inset from the image edge — often outside the search radius.
+
+   FIX: New detectByPocketQuadrants(). Splits the image into 4 quadrants and finds
+   the densest dark-pixel cluster within each quadrant (not just near the corners).
+   Finds the pocket circles reliably regardless of board position on screen.
+
+   ROOT CAUSE C — isBoardBorder() had overly loose orange detection that also
+   matched the warm-tan playing surface, causing false positives that inflated the
+   bounding box. Light tan wood (the surface) is NOT orange.
+
+   FIX: Tightened isOrangeBorder(). Added explicit saturation check: requires
+   R > G×1.3 (warm orange ratio) AND B < 75. The playing surface fails this
+   (its R-B gap is 30–80, not 100+).
+
+   ROOT CAUSE D — No method ever tried to find the board by its playing surface
+   colour. Added detectByWoodSurface() as Method 3 — scans for warm tan pixels
+   (the playing area), finds their bounding box, and expands by 8 % for the frame.
+
+2. Striker not detected  [BoardDetector.java]
+
+   ROOT CAUSE: run() identified the striker as "largest white blob in bottom 38 %
+   of board". In Carrom Disc Pool the striker is a BLUE / SILVER metallic disc
+   (RGB ≈ 90, 110, 185) — not white. It was never detected, so the code always
+   fell back to a fixed default position → autoplay aimed from the wrong spot.
+
+   FIX: classifyPx() now recognises blue pixels (B > R + 20, B dominant channel,
+   lum 70–200). Blue blobs are clustered separately. In run(), striker detection
+   first checks for a blue blob in the striker zone; falls back to white only if
+   no blue found. Blue striker clusters are excluded from the coin list.
+
+3. Aim lines invisible / wrong visual style  [AimOverlayView.java — rewritten in v8.2]
+
+   Already fixed in the previous build:
+   • Two-segment "bent" aim paths: striker → ghost contact, then coin → pocket
+   • Glow effect: each line drawn twice (wide semi-transparent pass + narrow core)
+   • Line widths: 16 dp glow / 5 dp core for best shot; progressively thinner
+   • White glow on striker path, dark core on coin→pocket path (matches video ref)
+   • Ghost-ball contact dot (subtle circle at hit point)
+   • Lines drawn back-to-front: best shot rendered last (always on top)
+
+4. Smart fallback tuned for Carrom Disc Pool  [BoardDetector.java]
+
+   Old fallback used 8 % top / 5 % bottom for UI bars. Carrom Disc Pool has a
+   larger top UI (player avatars + score) ≈ 14 % and bottom controls ≈ 10 %.
+   FIX: smartFallback() now uses 14 % top / 10 % bottom, board side = 94 % of
+   screen width (observed from screenshot).
+
+METHODS ORDER IN NEW DETECTOR
+──────────────────────────────
+   1. detectByOrangeDensity()    — row/col density scan of orange border (primary)
+   2. detectByPocketQuadrants()  — 4 large black corner circles (secondary)
+   3. detectByWoodSurface()      — warm-tan playing surface bounding box (tertiary)
+   4. smartFallback()            — 94 % screen width, always succeeds (last resort)
+
+UNCHANGED FROM v8.2
+────────────────────
+   TrajectorySimulator.java, CarromAI.java, AutoShootService.java,
+   OverlayModule.java, ScreenCaptureService.java, FloatingOverlayService.java,
+   App.tsx, android/app/build.gradle

@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "ovk_19KHlfRs_3FvMPLUb"
+uri = "file://attached_assets/carrom-aimxassist-v8.3-fixed.tar.gz"
+type = "unspecified"
+title = "carrom-aimxassist-v8.3-fixed.tar.gz"
