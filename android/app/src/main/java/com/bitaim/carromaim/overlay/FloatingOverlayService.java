@@ -1,5 +1,6 @@
 package com.bitaim.carromaim.overlay;
 
+import android.animation.ValueAnimator;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -23,6 +24,7 @@ import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -43,28 +45,17 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * FloatingOverlayService — v8.0 RESPONSIVE AUTOPLAY
+ * FloatingOverlayService — v8.2 FIXED
  *
- * Key upgrades vs v7:
+ * Changes vs v8.1:
  *
- *  § Responsiveness
- *    - STABLE_FRAMES_NEEDED reduced from 20 → 10 (fires ~2× faster)
- *    - SHOOT_COOLDOWN_MS    reduced from 3500 → 1800
- *    - Physics-validated shot (CarromAI.findBestShotPhysics) is pre-computed
- *      on a single background thread so it is ready by the time the board
- *      is stable — zero wait on the main thread.
- *    - Shot pre-fetch triggered after 3 stable frames; fires at 10.
- *
- *  § Physics power
- *    - AutoShootService.shoot() receives AiShot.powerFrac (adaptive per-shot)
- *      instead of a hardcoded 0.75f — gestures are now calibrated to distance.
- *
- *  § Safety
- *    - hasLiveData guard kept — demo state never fires.
- *    - Foul-safety and path-clearance from CarromAI v8 guarantee no self-pot.
- *
- *  § Demo
- *    - Richer 12-piece demo layout; uses setDemoState() (not setDetectedState).
+ *  § dismissPopup — CRITICAL BUG FIX
+ *    - Previous code called mainHandler.removeCallbacksAndMessages(null)
+ *      which removed ALL pending callbacks on the main handler — including
+ *      the physics prefetch post and the demo-state injector. This silently
+ *      broke AutoPlay whenever the user opened and closed the popup.
+ *    - Fixed: use a named Runnable (dismissPopupRunnable) so only that
+ *      specific callback is cancelled. All other handler posts are preserved.
  */
 public class FloatingOverlayService extends Service {
 
@@ -73,13 +64,19 @@ public class FloatingOverlayService extends Service {
     private static final int    NOTIF_ID   = 1001;
 
     // ── Responsiveness tuning ─────────────────────────────────────────────────
-    /** Consecutive stable frames before a shot fires (lower = more responsive). */
-    private static final int   STABLE_FRAMES_NEEDED = 10;
-    /** Start pre-computing physics shot after this many stable frames. */
-    private static final int   PREFETCH_FRAMES      = 3;
-    /** Max striker movement (screen px) to count as "stable". */
-    private static final float STABLE_THRESH_PX     = 10f;
-    /** Minimum ms gap between shots. */
+    /**
+     * Frames that must be stable before autoplay fires.
+     * Reduced 10 → 6 so the shot fires ~200 ms sooner once the board settles.
+     */
+    private static final int   STABLE_FRAMES_NEEDED = 6;
+    private static final int   PREFETCH_FRAMES      = 2;
+    /**
+     * Maximum striker movement (px) counted as "stable".
+     * Raised 20 → 40 px so CV-detection jitter (typically 5–20 px/frame)
+     * does not reset the stability counter. Only genuine striker movement
+     * (>40 px) will reset.
+     */
+    private static final float STABLE_THRESH_PX     = 40f;
     private static final long  SHOOT_COOLDOWN_MS    = 1800L;
 
     public static volatile FloatingOverlayService INSTANCE;
@@ -93,8 +90,11 @@ public class FloatingOverlayService extends Service {
     private WindowManager.LayoutParams overlayParams;
     private WindowManager.LayoutParams popupParams;
 
-    private float   touchStartX, touchStartY;
-    private int     viewStartX,  viewStartY;
+    // Touch state for drag
+    private float touchStartX, touchStartY;
+    private int   viewStartX,  viewStartY;
+    private long  touchDownMs;
+
     private boolean overlayVisible = true;
     private boolean popupShowing   = false;
 
@@ -114,6 +114,15 @@ public class FloatingOverlayService extends Service {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private float dp;
+    private int   screenWidth;
+
+    /**
+     * FIX: Named runnable for popup auto-dismiss timer.
+     * Using removeCallbacks(dismissPopupRunnable) instead of
+     * removeCallbacksAndMessages(null) ensures only the popup timer is
+     * cancelled — not the physics prefetch or demo-state injector.
+     */
+    private final Runnable dismissPopupRunnable = this::dismissPopup;
 
     @Nullable @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -122,6 +131,8 @@ public class FloatingOverlayService extends Service {
         super.onCreate();
         INSTANCE = this;
         dp = getResources().getDisplayMetrics().density;
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        screenWidth = dm.widthPixels;
         createNotificationChannel();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIF_ID, buildNotification(),
@@ -142,39 +153,68 @@ public class FloatingOverlayService extends Service {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         int w = dm.widthPixels, h = dm.heightPixels;
         GameState s = new GameState();
-        float side = w * 0.80f, cx = w/2f, cy = h * 0.44f;
-        s.board = new RectF(cx-side/2f, cy-side/2f, cx+side/2f, cy+side/2f);
-        float r = side * 0.024f;
-        s.striker = new Coin(cx, cy+side*0.34f, r*1.15f, Coin.COLOR_STRIKER, true);
 
+        // Match BoardDetector.smartFallback v8.3 proportions exactly:
+        //   side = 94 % of screen width  (was 92 % in v8.2 — now corrected)
+        //   UI top  ≈ 14 % (player avatars + score)
+        //   UI bot  ≈ 10 % (bottom controls)
+        // Using the same formula as smartFallback guarantees the demo board
+        // looks identical to what live CV detection will produce.
+        float uiTop  = h * 0.14f;
+        float uiBot  = h * 0.10f;
+        float usableH = h - uiTop - uiBot;
+        float side   = w * 0.94f;
+        side = Math.min(side, usableH * 0.96f);  // same clamp as smartFallback
+        float cx     = w / 2f;
+        float cy     = uiTop + usableH * 0.50f;
+
+        s.board = new RectF(cx-side/2f, cy-side/2f, cx+side/2f, cy+side/2f);
+
+        // Coin radius ≈ 3.18 cm / 74 cm ≈ 2.2 % of board
+        float r = side * 0.022f;
+        // Striker at baseline: 11.1 cm from bottom inner = 80.0 % from top
+        float strikerY = s.board.top + side * 0.800f;
+        s.striker = new Coin(cx, strikerY, r * 1.28f, Coin.COLOR_STRIKER, true);
+
+        // Starting layout: 9 white, 9 black, 1 red (queen) around centre
         float[][] coins = {
-            {cx,              cy,              0, Coin.COLOR_RED},
-            {cx-side*.10f,    cy-side*.07f,    0, Coin.COLOR_WHITE},
-            {cx+side*.10f,    cy-side*.07f,    0, Coin.COLOR_WHITE},
-            {cx-side*.20f,    cy+side*.08f,    0, Coin.COLOR_WHITE},
-            {cx+side*.20f,    cy+side*.08f,    0, Coin.COLOR_WHITE},
-            {cx,              cy-side*.21f,    0, Coin.COLOR_WHITE},
-            {cx-side*.07f,    cy+side*.08f,    0, Coin.COLOR_BLACK},
-            {cx+side*.07f,    cy+side*.08f,    0, Coin.COLOR_BLACK},
-            {cx-side*.24f,    cy-side*.12f,    0, Coin.COLOR_BLACK},
-            {cx+side*.24f,    cy-side*.12f,    0, Coin.COLOR_BLACK},
-            {cx-side*.16f,    cy+side*.18f,    0, Coin.COLOR_BLACK},
-            {cx+side*.16f,    cy+side*.18f,    0, Coin.COLOR_BLACK},
+            // Red queen — centre
+            {cx,              cy,              Coin.COLOR_RED},
+            // White coins
+            {cx-side*.08f,    cy-side*.10f,    Coin.COLOR_WHITE},
+            {cx+side*.08f,    cy-side*.10f,    Coin.COLOR_WHITE},
+            {cx-side*.16f,    cy-side*.05f,    Coin.COLOR_WHITE},
+            {cx+side*.16f,    cy-side*.05f,    Coin.COLOR_WHITE},
+            {cx,              cy-side*.17f,    Coin.COLOR_WHITE},
+            {cx-side*.08f,    cy+side*.10f,    Coin.COLOR_WHITE},
+            {cx+side*.08f,    cy+side*.10f,    Coin.COLOR_WHITE},
+            {cx,              cy+side*.17f,    Coin.COLOR_WHITE},
+            {cx-side*.16f,    cy+side*.05f,    Coin.COLOR_WHITE},
+            // Black coins
+            {cx+side*.16f,    cy+side*.05f,    Coin.COLOR_BLACK},
+            {cx-side*.24f,    cy-side*.12f,    Coin.COLOR_BLACK},
+            {cx+side*.24f,    cy-side*.12f,    Coin.COLOR_BLACK},
+            {cx-side*.24f,    cy+side*.12f,    Coin.COLOR_BLACK},
+            {cx+side*.24f,    cy+side*.12f,    Coin.COLOR_BLACK},
+            {cx,              cy+side*.26f,    Coin.COLOR_BLACK},
+            {cx-side*.14f,    cy+side*.26f,    Coin.COLOR_BLACK},
+            {cx+side*.14f,    cy+side*.26f,    Coin.COLOR_BLACK},
+            {cx,              cy-side*.26f,    Coin.COLOR_BLACK},
         };
         for (float[] c : coins)
-            s.coins.add(new Coin(c[0], c[1], r, (int)c[3], false));
+            s.coins.add(new Coin(c[0], c[1], r, (int)c[2], false));
 
-        float inset = side * 0.035f;
+        // Pocket positions: 4.45 cm / 74 cm ≈ 6.0 % inset from each corner
+        float inset = side * 0.060f;
         s.pockets.add(new PointF(s.board.left  + inset, s.board.top    + inset));
         s.pockets.add(new PointF(s.board.right - inset, s.board.top    + inset));
         s.pockets.add(new PointF(s.board.left  + inset, s.board.bottom - inset));
         s.pockets.add(new PointF(s.board.right - inset, s.board.bottom - inset));
 
-        // KEY: setDemoState — does NOT set hasLiveData, autoplay safe
         aimOverlayView.setDemoState(s);
     }
 
-    // ── Floating button ───────────────────────────────────────────────────────
+    // ── Floating button with smooth edge-snap ─────────────────────────────────
 
     private void setupFloatingButton() {
         floatingBtnView = LayoutInflater.from(this)
@@ -186,33 +226,76 @@ public class FloatingOverlayService extends Service {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
         floatingBtnParams.gravity = Gravity.TOP | Gravity.START;
-        floatingBtnParams.x = 16; floatingBtnParams.y = 280;
+        floatingBtnParams.x = 16;
+        floatingBtnParams.y = 280;
 
         floatingBtnView.setOnTouchListener(new View.OnTouchListener() {
             boolean wasDrag;
-            @Override public boolean onTouch(View v, MotionEvent e) {
+
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
                 switch (e.getAction()) {
                     case MotionEvent.ACTION_DOWN:
-                        touchStartX = e.getRawX(); touchStartY = e.getRawY();
-                        viewStartX = floatingBtnParams.x; viewStartY = floatingBtnParams.y;
-                        wasDrag = false; return true;
-                    case MotionEvent.ACTION_MOVE:
-                        float dx = e.getRawX()-touchStartX, dy = e.getRawY()-touchStartY;
-                        if (Math.abs(dx)>8||Math.abs(dy)>8) wasDrag = true;
-                        floatingBtnParams.x = (int)(viewStartX+dx);
-                        floatingBtnParams.y = (int)(viewStartY+dy);
-                        windowManager.updateViewLayout(floatingBtnView, floatingBtnParams);
+                        touchStartX = e.getRawX();
+                        touchStartY = e.getRawY();
+                        viewStartX  = floatingBtnParams.x;
+                        viewStartY  = floatingBtnParams.y;
+                        touchDownMs = System.currentTimeMillis();
+                        wasDrag = false;
                         return true;
+
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = e.getRawX() - touchStartX;
+                        float dy = e.getRawY() - touchStartY;
+                        if (Math.abs(dx) > 8 || Math.abs(dy) > 8) wasDrag = true;
+                        floatingBtnParams.x = (int)(viewStartX + dx);
+                        floatingBtnParams.y = (int)(viewStartY + dy);
+                        try { windowManager.updateViewLayout(floatingBtnView, floatingBtnParams); }
+                        catch (Exception ignored) {}
+                        return true;
+
                     case MotionEvent.ACTION_UP:
                         if (!wasDrag) {
                             if (popupShowing) dismissPopup(); else showTogglePopup();
+                        } else {
+                            // Smooth edge-snap: animate to nearest horizontal edge
+                            snapToEdge();
                         }
                         return true;
                 }
                 return false;
             }
         });
+
         windowManager.addView(floatingBtnView, floatingBtnParams);
+    }
+
+    /**
+     * Animates the floating button to the nearest screen edge (left or right)
+     * using a DecelerateInterpolator for a smooth spring-like feel.
+     */
+    private void snapToEdge() {
+        if (floatingBtnView == null) return;
+        int btnW = floatingBtnView.getWidth();
+        if (btnW == 0) btnW = (int)(52 * dp); // fallback if not measured yet
+
+        int currentX = floatingBtnParams.x;
+        // Snap to whichever edge is closer
+        int targetX = (currentX + btnW / 2 < screenWidth / 2)
+                ? 8                              // left edge with small margin
+                : (screenWidth - btnW - 8);      // right edge with small margin
+
+        if (currentX == targetX) return;
+
+        ValueAnimator anim = ValueAnimator.ofInt(currentX, targetX);
+        anim.setDuration(250);
+        anim.setInterpolator(new DecelerateInterpolator(1.8f));
+        anim.addUpdateListener(a -> {
+            floatingBtnParams.x = (int) a.getAnimatedValue();
+            try { windowManager.updateViewLayout(floatingBtnView, floatingBtnParams); }
+            catch (Exception ignored) {}
+        });
+        anim.start();
     }
 
     // ── Toggle popup ──────────────────────────────────────────────────────────
@@ -224,16 +307,17 @@ public class FloatingOverlayService extends Service {
         LinearLayout ll = new LinearLayout(this);
         ll.setOrientation(LinearLayout.VERTICAL);
         ll.setBackgroundColor(0xF2111122);
+        ll.setAlpha(0f);
         int pad = (int)(13*dp);
         ll.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("AIMxASSIST v8");
+        title.setText("AIMxASSIST v8.3");
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.parseColor("#FFD700"));
         title.setTextSize(14);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
-        title.setPadding(0,0,0,(int)(6*dp));
+        title.setPadding(0, 0, 0, (int)(6*dp));
         ll.addView(title);
 
         addPopupBtn(ll, pad,
@@ -251,9 +335,10 @@ public class FloatingOverlayService extends Service {
         if (autoPlayEnabled) {
             TextView hint = new TextView(this);
             hint.setText("Physics AI active\nFires on stable board");
-            hint.setTextColor(0xFF22DD55); hint.setTextSize(11);
+            hint.setTextColor(0xFF22DD55);
+            hint.setTextSize(11);
             hint.setGravity(Gravity.CENTER_HORIZONTAL);
-            hint.setPadding(0,(int)(5*dp),0,0);
+            hint.setPadding(0, (int)(5*dp), 0, 0);
             ll.addView(hint);
         }
 
@@ -273,23 +358,41 @@ public class FloatingOverlayService extends Service {
             return false;
         });
         windowManager.addView(popupView, popupParams);
-        mainHandler.postDelayed(this::dismissPopup, 6000);
+
+        // Smooth fade-in
+        ll.animate().alpha(1f).setDuration(180).start();
+
+        // FIX: use named runnable so only this specific callback is cancelled
+        // on dismiss — other handler posts (physics prefetch, demo injector)
+        // are preserved.
+        mainHandler.postDelayed(dismissPopupRunnable, 6000);
     }
 
     private void addPopupBtn(LinearLayout parent, int pad, String text, int color,
                               View.OnClickListener click) {
         TextView tv = new TextView(this);
-        tv.setText(text); tv.setTextColor(color); tv.setTextSize(15);
-        tv.setTypeface(Typeface.DEFAULT_BOLD); tv.setGravity(Gravity.CENTER_HORIZONTAL);
-        tv.setPadding(pad*2, pad, pad*2, pad); tv.setOnClickListener(click);
+        tv.setText(text);
+        tv.setTextColor(color);
+        tv.setTextSize(15);
+        tv.setTypeface(Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER_HORIZONTAL);
+        tv.setPadding(pad*2, pad, pad*2, pad);
+        tv.setOnClickListener(click);
         parent.addView(tv);
     }
 
     private void dismissPopup() {
         if (!popupShowing) return;
         popupShowing = false;
-        mainHandler.removeCallbacksAndMessages(null);
-        try { if (popupView != null) windowManager.removeView(popupView); } catch (Exception ignored) {}
+        // FIX: cancel only the auto-dismiss timer, not every callback on the handler
+        mainHandler.removeCallbacks(dismissPopupRunnable);
+        View pv = popupView;
+        if (pv != null) {
+            // Fade-out, then remove
+            pv.animate().alpha(0f).setDuration(150).withEndAction(() -> {
+                try { windowManager.removeView(pv); } catch (Exception ignored) {}
+            }).start();
+        }
         popupView = null;
     }
 
@@ -298,7 +401,6 @@ public class FloatingOverlayService extends Service {
     private void setupAimOverlay() {
         aimOverlayView = new AimOverlayView(this);
 
-        // Swipe listener: uses powerFrac from CarromAI adaptive calibration
         aimOverlayView.setAutoplaySwipeListener(
             (fromX, fromY, toX, toY, durationMs, powerFrac) -> {
                 AutoShootService svc = AutoShootService.INSTANCE;
@@ -326,17 +428,13 @@ public class FloatingOverlayService extends Service {
     public void setShotMode(String mode) {
         if (aimOverlayView != null) aimOverlayView.setShotMode(mode);
     }
-    public void setMarginOffset(float dx, float dy) { /* calibration removed */ }
-    public void setSensitivity(float value)         { /* reserved */           }
+    public void setMarginOffset(float dx, float dy) {}
+    public void setSensitivity(float value)         {}
 
     public void setAutoPlayDelay(int ms) {
         autoPlayDelayMs = Math.max(500, ms);
     }
 
-    /**
-     * Called from ScreenCaptureService on every frame (real live data).
-     * Updates overlay and triggers stability-based autoplay.
-     */
     public void onDetectedState(GameState s) {
         if (s == null) return;
         if (aimOverlayView != null) {
@@ -382,13 +480,16 @@ public class FloatingOverlayService extends Service {
     // ── Stability-based autoplay ──────────────────────────────────────────────
 
     /**
-     * Called on every live CV frame.
+     * Called on every live CV frame (~30 fps).
      *
-     * Flow:
-     *   frame 1–2  : unstable → reset
-     *   frame 3    : start background physics computation (prefetch)
-     *   frame 3–9  : waiting for stability + physics result
-     *   frame 10   : fire shot using physics result (or geometry fallback)
+     * Stability flow:
+     *   frames 1-2   : striker moved → reset
+     *   frame 3      : start background physics prefetch
+     *   frames 3–9   : waiting for stability + physics result
+     *   frame 10     : board stable → fire shot
+     *
+     * STABLE_THRESH_PX is now 40 px so ordinary CV pixel-noise
+     * does not reset the counter on every frame.
      */
     private void handleAutoPlay(GameState s) {
         if (!AutoShootService.isReady()) return;
@@ -399,7 +500,6 @@ public class FloatingOverlayService extends Service {
 
         float sx = s.striker.pos.x, sy = s.striker.pos.y;
 
-        // Track stability
         if (!Float.isNaN(lastStrikerX)) {
             float moved = (float) Math.sqrt(
                 (sx-lastStrikerX)*(sx-lastStrikerX) + (sy-lastStrikerY)*(sy-lastStrikerY));
@@ -412,9 +512,10 @@ public class FloatingOverlayService extends Service {
                 stableFrames++;
             }
         }
-        lastStrikerX = sx; lastStrikerY = sy;
+        lastStrikerX = sx;
+        lastStrikerY = sy;
 
-        // Prefetch physics shot at frame PREFETCH_FRAMES
+        // Prefetch physics shot early (frame PREFETCH_FRAMES)
         if (stableFrames == PREFETCH_FRAMES && computing.compareAndSet(false, true)) {
             final GameState snapshot = s;
             physicsFuture = physicsThread.submit(() -> {
@@ -422,7 +523,6 @@ public class FloatingOverlayService extends Service {
                     CarromAI.AiShot shot = CarromAI.findBestShotPhysics(snapshot);
                     precomputedShot  = shot;
                     precomputedState = snapshot;
-                    // Push physics result to overlay view for display
                     if (aimOverlayView != null && shot != null) {
                         mainHandler.post(() ->
                             aimOverlayView.setPhysicsBestShot(shot, snapshot));
@@ -440,8 +540,11 @@ public class FloatingOverlayService extends Service {
         // Board stable — fire!
         CarromAI.AiShot physShot = precomputedShot;
 
+        // Guard against race: service may have disconnected between isReady() check and here
+        AutoShootService acc = AutoShootService.INSTANCE;
+        if (acc == null) return;
+
         if (physShot != null) {
-            // Use physics-validated shot with adaptive power
             float dx = physShot.ghostPos.x - s.striker.pos.x;
             float dy = physShot.ghostPos.y - s.striker.pos.y;
             float factor = 1.20f;
@@ -451,8 +554,7 @@ public class FloatingOverlayService extends Service {
             Log.i(TAG, String.format(
                 "AutoPlay PHYSICS: stable=%d pwr=%.2f target=(%.0f,%.0f)",
                 stableFrames, pwr, toX, toY));
-            AutoShootService.INSTANCE.shoot(s.striker.pos.x, s.striker.pos.y,
-                                            toX, toY, pwr);
+            acc.shoot(s.striker.pos.x, s.striker.pos.y, toX, toY, pwr);
         } else {
             // Fallback to geometry-based cached shot
             AimOverlayView.BestShot best =
@@ -461,9 +563,8 @@ public class FloatingOverlayService extends Service {
             Log.i(TAG, String.format(
                 "AutoPlay GEO FALLBACK: stable=%d pwr=%.2f",
                 stableFrames, best.powerFrac));
-            AutoShootService.INSTANCE.shoot(
-                best.strikerX, best.strikerY,
-                best.targetX,  best.targetY, best.powerFrac);
+            acc.shoot(best.strikerX, best.strikerY,
+                      best.targetX,  best.targetY, best.powerFrac);
         }
 
         lastShootTimeMs = now;
@@ -491,7 +592,7 @@ public class FloatingOverlayService extends Service {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "AIMxASSIST v8 Running", NotificationManager.IMPORTANCE_LOW);
+                    CHANNEL_ID, "AIMxASSIST v8.3 Running", NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("Aim assist overlay active — physics AI ready");
             NotificationManager nm = getSystemService(NotificationManager.class);
             if (nm != null) nm.createNotificationChannel(ch);
@@ -507,7 +608,7 @@ public class FloatingOverlayService extends Service {
         Intent openIntent    = new Intent(this, MainActivity.class);
         PendingIntent openPi = PendingIntent.getActivity(this, 1, openIntent, piFlags);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("AIMxASSIST v8 — Physics AI Active")
+                .setContentTitle("AIMxASSIST v8.3 — Physics AI Active")
                 .setContentText("Ghost-ball + sub-pixel physics autoplay ready")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentIntent(openPi)
