@@ -1,5 +1,6 @@
 package com.bitaim.carromaim.capture;
 
+import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -100,9 +101,9 @@ public class ScreenCaptureService extends Service {
         if (intent == null) return START_NOT_STICKY;
         if (mediaProjection != null) return START_STICKY;
 
-        int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity_RESULT_CANCELED);
+        int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED);
         Intent data = intent.getParcelableExtra(EXTRA_DATA);
-        if (resultCode == 0 || data == null) {
+        if (resultCode == Activity.RESULT_CANCELED || data == null) {
             Log.w(TAG, "Missing projection extras");
             stopSelf();
             return START_NOT_STICKY;
@@ -127,8 +128,6 @@ public class ScreenCaptureService extends Service {
         startCapture();
         return START_STICKY;
     }
-
-    private static final int Activity_RESULT_CANCELED = 0;
 
     private void startCapture() {
         // Downscale the captured framebuffer for processing efficiency.
