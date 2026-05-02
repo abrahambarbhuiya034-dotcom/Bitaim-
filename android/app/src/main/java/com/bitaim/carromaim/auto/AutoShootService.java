@@ -12,8 +12,8 @@ import android.view.accessibility.AccessibilityEvent;
  * to automatically shoot the striker in Carrom Disc Pool.
  *
  * How it works:
- *  1. FloatingOverlayService detects a stable board state (15+ consecutive
- *     frames with no movement) and calls shoot().
+ *  1. FloatingOverlayService detects a stable board state (6 consecutive
+ *     frames with no movement, i.e. STABLE_FRAMES_NEEDED) and calls shoot().
  *  2. shoot() dispatches a swipe gesture starting at the striker position
  *     and moving in the direction of the best shot target.
  *  3. The gesture simulates a human finger flick — identical to a real shot.
